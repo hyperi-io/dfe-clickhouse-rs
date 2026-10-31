@@ -12,7 +12,7 @@ It depends on the published `clickhouse` release and changes nothing in it, so t
 - Explicit per-table batches: each insert targets one table and commits on `end()`, sent over TCP as Native blocks flushed at 1 MiB.
 - Insert errors classified as transport, schema drift or bad rows. A transport failure can leave it unknown whether the rows landed, so retry only where a duplicate is harmless or deduplicated.
 - An opt-in unified client (`unified` feature): one `UnifiedClient` that runs the same queries and inserts over HTTP or native TCP, the transport chosen by configuration at runtime.
-- `JSON`, `Variant` and `Dynamic` columns read back as their document text.
+- `JSON`, `Variant` and `Dynamic` columns read back as their document text over native TCP. A value ClickHouse spilled to `SharedVariant` is not decoded: a JSON path stored there is left out, and a `Dynamic` one reads as `null`.
 - `ServerException::parse` to read the ClickHouse error code and name out of an HTTP error.
 
 ## Example

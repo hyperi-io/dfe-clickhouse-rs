@@ -7,14 +7,16 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/hyperi-io/dfe-clickhouse-rs/blob/main/LICENSE)
 <!-- BADGES:END -->
 
-> The official ClickHouse Rust client speaks HTTP and nothing else. Plenty of
-> deployments expose port 9000 and no HTTP at all. `JSON`, `Variant` and
-> `Dynamic` columns do not read. Inserting needs a struct known at compile
-> time, which a loader taking arbitrary shapes off a topic does not have.
+Extensions for the official [`clickhouse`](https://crates.io/crates/clickhouse) Rust client, built for loading data in volume. It depends on the published `clickhouse` release and changes nothing in it, so the HTTP client you already use keeps working as it is.
 
-Extensions for the official client, as a separate crate depending on the
-published `clickhouse` release. Adds a native TCP transport, runtime-schema
-inserts, and one client that dispatches over either.
+## What it gives you
+
+- The native protocol on port 9000, with TLS, a connection pool, endpoint failover and opt-in jittered retry for idempotent calls.
+- Runtime-schema inserts: hand it `serde_json::Map` rows, with no Rust struct written per table.
+- A per-table schema read from `system.columns` and cached, so rows encode straight to RowBinary or Native.
+- An opt-in `UnifiedClient` that runs the same queries and inserts over HTTP or native TCP, the transport chosen by configuration at runtime.
+- `JSON`, `Variant` and `Dynamic` columns read back as their document text over native TCP. A value ClickHouse spilled to `SharedVariant` is not decoded: a JSON path stored there is left out, and a `Dynamic` one reads as `null`.
+- `ServerException::parse` to read the ClickHouse error code and name out of an HTTP error.
 
 ```console
 cargo add clickhouse dfe-clickhouse
