@@ -177,7 +177,7 @@ upstream, and the graph does not carry it:
 
 | Repo | Direction | Kind | Mechanism |
 |---|---|---|---|
-| `ClickHouse/clickhouse-rs` | inbound | published crate, by version | `Cargo.toml` depends on `clickhouse` 0.15.2 with `default-features = false`, and on nothing from that repo's git. Edition 2024, MSRV 1.89.0 and the lint set are kept in step with it so code can be cherry-picked in either direction |
+| `ClickHouse/clickhouse-rs` | inbound | published crate, by version | `Cargo.toml` depends on the published `clickhouse` release, with `default-features = false`, and on nothing from that repo's git. Edition 2024, MSRV 1.89.0 and the lint set are kept in step with it so code can be cherry-picked in either direction |
 
 ## Issues
 
