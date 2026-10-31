@@ -3,6 +3,12 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [0.1.5](https://github.com/hyperi-io/dfe-clickhouse-rs/compare/v0.1.4...v0.1.5) (2026-10-31)
+
+### Bug Fixes
+
+* close the pool, timeout and error-classification holes in the client ([#29](https://github.com/hyperi-io/dfe-clickhouse-rs/issues/29)) ([6c65c34](https://github.com/hyperi-io/dfe-clickhouse-rs/commit/6c65c34f3048bf4cea7889128cdcf07e1f43eb6f))
+
 ## [0.1.4](https://github.com/hyperi-io/dfe-clickhouse-rs/compare/v0.1.3...v0.1.4) (2026-10-29)
 
 ### Bug Fixes
