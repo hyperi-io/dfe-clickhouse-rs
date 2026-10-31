@@ -30,19 +30,23 @@ pub struct ServerException {
 }
 
 impl ServerException {
-    /// `None` for any other [`Error`] variant, and for a body that neither opens
-    /// with `Code: N.` nor is a bare code -- a proxy page or a bare status line.
-    /// A bare code parses with an empty `message`.
+    /// `None` for any other [`Error`] variant, and for a body that does not open
+    /// with `Code: N` -- a proxy page or a bare status line. A `Code: N` with
+    /// nothing after it parses with an empty `message`.
     #[must_use]
     pub fn parse(error: &Error) -> Option<Self> {
         let Error::BadResponse(body) = error else {
             return None;
         };
+        let body = body.trim();
 
-        // Upstream's `reason()` in `response.rs` substitutes the
-        // `X-ClickHouse-Exception-Code` header for a body that is empty, not
-        // UTF-8, or fails mid-read.
-        if let Ok(code) = body.trim().parse::<i32>() {
+        // Upstream's `collect_response` in `response.rs` writes the
+        // `X-ClickHouse-Exception-Code` header as `Code: {code}` for a body that
+        // is empty, not UTF-8, or fails mid-read.
+        if let Some(code) = body
+            .strip_prefix("Code: ")
+            .and_then(|c| c.parse::<i32>().ok())
+        {
             return Some(Self {
                 code,
                 name: None,
@@ -228,6 +232,11 @@ mod tests {
             "DB::Exception: oops",
             // A code but no message left after stripping.
             "Code: 60. DB::Exception: (UNKNOWN_TABLE)",
+            // A bare number is a proxy or status body, because upstream always
+            // writes the `Code: ` prefix when it substitutes the header.
+            "117",
+            "Code: ",
+            "Code: x",
         ] {
             let err = Error::BadResponse(body.into());
             assert!(
@@ -238,19 +247,24 @@ mod tests {
         assert!(ServerException::parse(&Error::TimedOut).is_none());
     }
 
-    /// Declining a bare code loses the only field a caller classifies on.
+    /// Upstream's `collect_response` writes `Code: {header}` with no message
+    /// when the body is empty or unreadable, and declining it loses the only
+    /// field a caller classifies on.
     #[test]
-    fn parse_accepts_the_bare_code_upstream_falls_back_to() {
-        let exc = ServerException::parse(&Error::BadResponse("117".into()))
-            .expect("a bare exception code is a rejection, not junk");
+    fn parse_accepts_the_code_only_body_upstream_substitutes() {
+        let exc = ServerException::parse(&Error::BadResponse("Code: 117".into()))
+            .expect("a code-only body is a rejection, not junk");
         assert_eq!(exc.code, 117);
         assert_eq!(exc.name, None);
         assert!(exc.message.is_empty(), "no message is on the wire to read");
         assert!(exc.stack_trace.is_none());
+        assert!(
+            !exc.is_retriable(),
+            "117 is bad data, not a transient fault"
+        );
 
-        // Upstream trims the body, and a retriable code still reads as one.
-        let exc = ServerException::parse(&Error::BadResponse(" 202 ".into()))
-            .expect("a padded bare code still parses");
+        let exc = ServerException::parse(&Error::BadResponse(" Code: 202 ".into()))
+            .expect("a padded code-only body still parses");
         assert_eq!(exc.code, 202);
         assert!(exc.is_retriable());
     }

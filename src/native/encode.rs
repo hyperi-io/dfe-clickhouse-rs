@@ -5,14 +5,14 @@
 //!
 //! # Supported types for INSERT
 //!
-//! All scalar fixed-size types, String, FixedString(N), Nullable(T),
+//! All scalar fixed-size types, String, FixedString(N), Point, Nullable(T),
 //! LowCardinality(T), Array(T), Map(K, V), Tuple(T1..Tn), and nested combinations.
 //! `LowCardinality` is fully encoded with a per-block dictionary + indices.
-//! JSON is declared and written as a String column and cast server-side.
+//! JSON, at any depth, is declared and written as String and cast server-side.
 //! Variant and Dynamic are not yet supported.
 
 use crate::error::{Error, Result};
-use crate::native::columns::ColumnType;
+use crate::native::columns::{ColumnType, json_spelled_as_string};
 use crate::native::io::ClickHouseBytesWrite;
 
 /// Minimum server protocol revision where a block carries a per-column
@@ -24,12 +24,17 @@ pub(crate) const DBMS_MIN_PROTOCOL_VERSION_WITH_CUSTOM_SERIALIZATION: u64 = 5445
 /// `LowCardinality` column.
 const HAS_ADDITIONAL_KEYS: u64 = 1 << 9;
 
+/// A `Point` cell in `RowBinary`: x then y, each a little-endian `Float64`.
+const POINT_BYTES: usize = 16;
+const POINT_HALF: usize = POINT_BYTES / 2;
+
 /// Column schema entry for a native INSERT block.
 #[derive(Debug, Clone)]
 pub struct ColumnSchema {
     /// Column name as declared to the server.
     pub(crate) name: String,
-    /// Type name string sent on the wire (`LowCardinality` stripped).
+    /// Type name the block declares: the server's, with each JSON spelled
+    /// `String`.
     pub(crate) type_name: String,
     /// Parsed column type used for encoding decisions.
     pub(crate) col_type: ColumnType,
@@ -53,7 +58,7 @@ impl ColumnSchema {
                 })?;
                 Ok(ColumnSchema {
                     name: name.clone(),
-                    type_name: type_name.clone(),
+                    type_name: json_spelled_as_string(type_name, &col_type).into_owned(),
                     col_type,
                 })
             })
@@ -123,14 +128,9 @@ pub fn encode_columns(
     let mut out = Vec::with_capacity(payload_size + header_size);
     for (ci, col) in columns.iter().enumerate() {
         out.put_string(col.name.as_bytes());
-        // A JSON column is declared as String and cast by the server, which
-        // converts block columns to the table's types by position
-        // (`InterpreterInsertQuery.cpp`, `makeConvertingActions`).
-        let type_name = match col.col_type {
-            ColumnType::NewJson | ColumnType::Json => "String",
-            _ => col.type_name.as_str(),
-        };
-        out.put_string(type_name.as_bytes());
+        // The server converts block columns to the table's types by position
+        // (`InterpreterInsertQuery.cpp`, `makeConvertingActions`), JSON included.
+        out.put_string(col.type_name.as_bytes());
         // Newer servers expect a custom-serialization flag byte (0 = normal) per column.
         if has_custom_ser {
             out.push(0u8);
@@ -190,6 +190,7 @@ fn write_col_values(values: &[&[u8]], col_type: &ColumnType, out: &mut Vec<u8>) 
                 | ColumnType::FixedString(_)
                 | ColumnType::Json
                 | ColumnType::NewJson
+                | ColumnType::TypedJson
         )
     {
         for v in values {
@@ -370,6 +371,15 @@ fn write_col_values(values: &[&[u8]], col_type: &ColumnType, out: &mut Vec<u8>) 
             }
         }
 
+        ColumnType::Point => {
+            // Native: `Tuple(Float64, Float64)`, so every x, then every y.
+            for half in [0..POINT_HALF, POINT_HALF..POINT_BYTES] {
+                for v in values {
+                    out.extend_from_slice(v.get(half.clone()).ok_or_else(rb_truncated)?);
+                }
+            }
+        }
+
         unsupported => {
             return Err(Error::BadResponse(format!(
                 "native INSERT: column type {unsupported:?} is not supported for INSERT"
@@ -397,7 +407,7 @@ fn rb_advance(data: &[u8], pos: &mut usize, col_type: &ColumnType) -> Result<()>
     }
 
     match col_type {
-        ColumnType::String | ColumnType::Json | ColumnType::NewJson => {
+        ColumnType::String | ColumnType::Json | ColumnType::NewJson | ColumnType::TypedJson => {
             let (len, hdr) = rb_read_varuint(data, *pos)?;
             let end = usize::try_from(len)
                 .ok()
@@ -410,6 +420,13 @@ fn rb_advance(data: &[u8], pos: &mut usize, col_type: &ColumnType) -> Result<()>
         }
         ColumnType::FixedString(n) => {
             let end = pos.checked_add(*n).ok_or_else(rb_truncated)?;
+            if end > data.len() {
+                return Err(rb_truncated());
+            }
+            *pos = end;
+        }
+        ColumnType::Point => {
+            let end = pos.checked_add(POINT_BYTES).ok_or_else(rb_truncated)?;
             if end > data.len() {
                 return Err(rb_truncated());
             }
@@ -468,11 +485,14 @@ fn rb_write_default(out: &mut Vec<u8>, col_type: &ColumnType) {
         return;
     }
     match col_type {
-        ColumnType::String | ColumnType::Json | ColumnType::NewJson => {
+        ColumnType::String | ColumnType::Json | ColumnType::NewJson | ColumnType::TypedJson => {
             out.put_var_uint(0); // empty string: single 0x00 varuint
         }
         ColumnType::FixedString(n) => {
             out.extend(std::iter::repeat_n(0u8, *n));
+        }
+        ColumnType::Point => {
+            out.extend(std::iter::repeat_n(0u8, POINT_BYTES));
         }
         ColumnType::LowCardinality(inner) => {
             rb_write_default(out, inner);
@@ -595,6 +615,53 @@ mod tests {
         let rows = vec![b"\x02{}".to_vec(), b"\x07{\"a\":1}".to_vec()];
         let out = encode_columns(&rows, &cols, 0).unwrap();
         assert_eq!(out.as_slice(), b"\x01j\x06String\x02{}\x07{\"a\":1}");
+    }
+
+    /// `(server type, type the block declares)`: every JSON in the tree is
+    /// declared `String`, because the encoder writes JSON as text at any depth.
+    #[test]
+    fn json_is_declared_as_string_wherever_it_nests() {
+        let cases = [
+            ("JSON(max_dynamic_paths=2048)", "String"),
+            ("JSON(`a.b` UInt32)", "String"),
+            ("Object('json')", "String"),
+            ("Nullable(JSON)", "Nullable(String)"),
+            ("Array(JSON)", "Array(String)"),
+            ("Array(JSON(max_dynamic_paths=2048))", "Array(String)"),
+            (
+                "Map(LowCardinality(String), JSON(max_dynamic_paths=16))",
+                "Map(LowCardinality(String), String)",
+            ),
+            ("Tuple(UInt8, Array(JSON))", "Tuple(UInt8, Array(String))"),
+            // Only the type is rewritten, never a label that spells it.
+            (
+                "Enum8('JSON' = 1, 'XML' = 2)",
+                "Enum8('JSON' = 1, 'XML' = 2)",
+            ),
+            (
+                "Map(LowCardinality(String), String)",
+                "Map(LowCardinality(String), String)",
+            ),
+            ("DateTime64(3, 'UTC')", "DateTime64(3, 'UTC')"),
+        ];
+        for (server, declared) in cases {
+            let cols = ColumnSchema::from_headers(&[("c".to_string(), server.to_string())])
+                .unwrap_or_else(|e| panic!("{server}: {e}"));
+            assert_eq!(cols[0].type_name, declared, "{server}");
+        }
+    }
+
+    /// `Point` is two `Float64` sub-columns on the wire: every x, then every y.
+    #[test]
+    fn a_point_column_writes_the_xs_then_the_ys() {
+        let row = |x: f64, y: f64| [x.to_le_bytes(), y.to_le_bytes()].concat();
+        let rows = vec![row(1.5, 2.5), row(-3.0, 4.0)];
+        let out = encode_columns(&rows, &schema("Point"), 0).expect("encodes");
+        let want = [1.5f64, -3.0, 2.5, 4.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<u8>>();
+        assert_eq!(body(&out, "Point"), want);
     }
 
     #[test]

@@ -24,6 +24,9 @@ use crate::native::io::{
 pub enum ColumnType {
     /// One raw byte per row.
     UInt8,
+    /// One byte per row, `0` or `1`, kept apart from [`Self::UInt8`] so a
+    /// value rendered as JSON reads `true` or `false`.
+    Bool,
     /// Two raw little-endian bytes per row.
     UInt16,
     /// Four raw little-endian bytes per row.
@@ -136,6 +139,10 @@ pub enum ColumnType {
     /// `JSON` -- u64 version (1 = one document string per row, 2 and 3 the
     /// path-based object formats).
     NewJson,
+    /// `JSON` with at least one typed path. Inserts and string-mode reads
+    /// treat it as [`Self::NewJson`], and a path-based read is refused,
+    /// because the typed sub-columns are not decoded.
+    TypedJson,
     /// Standalone `Dynamic` -- u64 version (1 deprecated, 2 intermediate,
     /// 3 flat), then discriminators and per-type column data.
     Dynamic,
@@ -313,9 +320,17 @@ impl ColumnType {
             return Some(Self::Dynamic);
         }
 
+        if let Some(args) = strip_outer(type_str, "JSON") {
+            return json_args(args).map(|kind| match kind {
+                JsonArgs::WireNeutral => Self::NewJson,
+                JsonArgs::TypedPaths => Self::TypedJson,
+            });
+        }
+
         match type_str {
             // Bool is an alias for UInt8 (true=1, false=0) on the wire.
-            "Bool" | "UInt8" => Some(Self::UInt8),
+            "UInt8" => Some(Self::UInt8),
+            "Bool" => Some(Self::Bool),
             "UInt16" => Some(Self::UInt16),
             "UInt32" => Some(Self::UInt32),
             "UInt64" => Some(Self::UInt64),
@@ -352,7 +367,7 @@ impl ColumnType {
     /// Fixed wire-format size in bytes; `None` for variable-length types.
     pub(crate) fn fixed_size(&self) -> Option<usize> {
         match self {
-            Self::UInt8 | Self::Int8 | Self::Enum8 => Some(1),
+            Self::UInt8 | Self::Bool | Self::Int8 | Self::Enum8 => Some(1),
             Self::BFloat16 | Self::UInt16 | Self::Int16 | Self::Date | Self::Enum16 => Some(2),
             Self::UInt32
             | Self::Int32
@@ -383,6 +398,7 @@ impl ColumnType {
             | Self::Map(_, _)
             | Self::Variant(_)
             | Self::NewJson
+            | Self::TypedJson
             | Self::Dynamic
             // Point is Tuple(Float64, Float64) in columnar format -- not a flat 16-byte blob.
             | Self::Point => None,
@@ -415,16 +431,176 @@ fn max_paren_depth(s: &str) -> usize {
     max
 }
 
+/// What a `JSON(...)` argument list does to the column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JsonArgs {
+    /// The two limits and `SKIP`: the wire layout is bare `JSON`'s.
+    WireNeutral,
+    /// At least one typed path (`a.b UInt32`), which adds sub-columns to the
+    /// path-based serialisation. Text in and out is unchanged.
+    TypedPaths,
+}
+
+/// Classify `JSON(...)` arguments, `None` for any the server would not
+/// spell.
+pub(crate) fn json_args(args: &str) -> Option<JsonArgs> {
+    let mut typed = false;
+    for arg in split_type_args(args) {
+        let arg = arg.trim();
+        // SKIP first: a regexp may itself contain `=`.
+        if let Some(rest) = arg.strip_prefix("SKIP") {
+            if !rest.starts_with(char::is_whitespace) {
+                return None;
+            }
+            continue;
+        }
+        let (path, rest) = split_json_path(arg)?;
+        match rest.strip_prefix('=') {
+            Some(value) => {
+                let known = matches!(path, "max_dynamic_paths" | "max_dynamic_types");
+                if !known || value.trim().parse::<u64>().is_err() {
+                    return None;
+                }
+            }
+            // A typed path: the path, then its type.
+            None if !rest.is_empty() => typed = true,
+            None => return None,
+        }
+    }
+    Some(if typed {
+        JsonArgs::TypedPaths
+    } else {
+        JsonArgs::WireNeutral
+    })
+}
+
+/// A JSON argument's leading path, backticked or bare, and the rest with
+/// leading whitespace dropped.
+fn split_json_path(arg: &str) -> Option<(&str, &str)> {
+    let (path, rest) = if let Some(quoted) = arg.strip_prefix('`') {
+        let end = quoted.find('`')?;
+        (&quoted[..end], &quoted[end + 1..])
+    } else {
+        let end = arg
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+            .unwrap_or(arg.len());
+        (&arg[..end], &arg[end..])
+    };
+    (!path.is_empty()).then(|| (path, rest.trim_start()))
+}
+
+/// `type_str` with each JSON in it spelled `String`, the type an INSERT block
+/// declares for JSON so the server parses the text into the column.
+///
+/// `col_type` is `type_str` already parsed, so the two are walked in step.
+pub(crate) fn json_spelled_as_string<'a>(
+    type_str: &'a str,
+    col_type: &ColumnType,
+) -> std::borrow::Cow<'a, str> {
+    use std::borrow::Cow;
+
+    let s = type_str.trim();
+    let wrapped = |name: &str, inner: &ColumnType| match strip_outer(s, name) {
+        Some(arg) => match json_spelled_as_string(arg, inner) {
+            Cow::Borrowed(_) => Cow::Borrowed(s),
+            Cow::Owned(arg) => Cow::Owned(format!("{name}({arg})")),
+        },
+        None => Cow::Borrowed(s),
+    };
+    let listed = |name: &str, fields: &[&ColumnType]| {
+        let Some(args) = strip_outer(s, name).map(split_type_args) else {
+            return Cow::Borrowed(s);
+        };
+        if args.len() != fields.len() {
+            return Cow::Borrowed(s);
+        }
+        let spelled: Vec<Cow<'_, str>> = args
+            .iter()
+            .zip(fields)
+            .map(|(arg, field)| json_spelled_as_string(arg, field))
+            .collect();
+        if spelled.iter().all(|arg| matches!(arg, Cow::Borrowed(_))) {
+            return Cow::Borrowed(s);
+        }
+        Cow::Owned(format!("{name}({})", spelled.join(", ")))
+    };
+
+    match col_type {
+        // Owned, because a borrow reads as "unchanged" to the wrappers above.
+        ColumnType::Json | ColumnType::NewJson | ColumnType::TypedJson => {
+            Cow::Owned("String".to_owned())
+        }
+        ColumnType::Nullable(inner) => wrapped("Nullable", inner),
+        ColumnType::LowCardinality(inner) => wrapped("LowCardinality", inner),
+        ColumnType::Array(inner) => wrapped("Array", inner),
+        ColumnType::Map(key, value) => listed("Map", &[key.as_ref(), value.as_ref()]),
+        ColumnType::Tuple(fields) => listed("Tuple", &fields.iter().collect::<Vec<_>>()),
+        ColumnType::Variant(fields) => listed("Variant", &fields.iter().collect::<Vec<_>>()),
+        ColumnType::UInt8
+        | ColumnType::Bool
+        | ColumnType::UInt16
+        | ColumnType::UInt32
+        | ColumnType::UInt64
+        | ColumnType::Int8
+        | ColumnType::Int16
+        | ColumnType::Int32
+        | ColumnType::Int64
+        | ColumnType::Int128
+        | ColumnType::UInt128
+        | ColumnType::Int256
+        | ColumnType::UInt256
+        | ColumnType::Float32
+        | ColumnType::Float64
+        | ColumnType::BFloat16
+        | ColumnType::Decimal32 { .. }
+        | ColumnType::Decimal64 { .. }
+        | ColumnType::Decimal128 { .. }
+        | ColumnType::Decimal256 { .. }
+        | ColumnType::String
+        | ColumnType::FixedString(_)
+        | ColumnType::Uuid
+        | ColumnType::IPv4
+        | ColumnType::IPv6
+        | ColumnType::Date
+        | ColumnType::Date32
+        | ColumnType::DateTime
+        | ColumnType::DateTime64 { .. }
+        | ColumnType::Time
+        | ColumnType::Time64
+        | ColumnType::Enum8
+        | ColumnType::Enum16
+        | ColumnType::SimpleAggregateFunction(_)
+        | ColumnType::Point
+        | ColumnType::Dynamic => Cow::Borrowed(s),
+    }
+}
+
 /// Split a comma-separated type argument list respecting parentheses depth.
 ///
 /// `"String, UInt64"` -> `["String", "UInt64"]`
 /// `"Array(String), UInt64"` -> `["Array(String)", "UInt64"]`
+///
+/// A comma inside a `'...'` literal or a `` `...` `` identifier, as in a
+/// `JSON(SKIP REGEXP 'a,b')`, does not split.
 fn split_type_args(s: &str) -> Vec<&str> {
     let mut result = Vec::new();
     let mut depth = 0usize;
     let mut start = 0;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
     for (i, c) in s.char_indices() {
+        if let Some(open) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == open {
+                quote = None;
+            }
+            continue;
+        }
         match c {
+            '\'' | '`' => quote = Some(c),
             '(' => depth += 1,
             ')' => depth = depth.saturating_sub(1),
             ',' if depth == 0 => {
@@ -604,6 +780,7 @@ fn read_column_at<'a, R: ClickHouseRead + 'a>(
 
         match col_type {
             ColumnType::UInt8
+            | ColumnType::Bool
             | ColumnType::Int8
             | ColumnType::Enum8
             | ColumnType::BFloat16
@@ -676,6 +853,7 @@ fn read_column_at<'a, R: ClickHouseRead + 'a>(
                 read_variant_column(reader, n, variant_types, depth).await
             }
             ColumnType::NewJson => read_json_column(reader, n, depth).await,
+            ColumnType::TypedJson => read_typed_json_column(reader, n).await,
             ColumnType::Dynamic => read_dynamic_column(reader, n, depth).await,
         }
     })
@@ -963,6 +1141,9 @@ async fn read_variant_column<R: ClickHouseRead>(
             "native protocol: Variant declares {k} arms, above the {MAX_VARIANT_TYPES} cap"
         )));
     }
+    for ct in variant_types {
+        refuse_unprintable_value("Variant", &type_label(ct), ct)?;
+    }
 
     // The mode word is not read here: it is this column's serialisation
     // prefix, consumed by `read_prefixes` before any of the column's data.
@@ -1035,6 +1216,26 @@ async fn read_json_column<R: ClickHouseRead>(
 
     let version = reader.read_u64_le().await?;
     read_json_body_at(reader, n, version, depth).await
+}
+
+/// A typed-path JSON column, readable in its one-string-per-row form only.
+async fn read_typed_json_column<R: ClickHouseRead>(reader: &mut R, n: usize) -> Result<ColumnData> {
+    use tokio::io::AsyncReadExt as _;
+
+    let version = reader.read_u64_le().await?;
+    if version != JSON_SERIALIZATION_STRING {
+        return Err(typed_json_unsupported());
+    }
+    read_string_column(reader, n).await
+}
+
+/// The refusal for a path-based read of a JSON column with typed paths.
+pub(crate) fn typed_json_unsupported() -> Error {
+    Error::Unsupported(
+        "JSON typed paths have no decoder in the path-based serialisation. \
+         Read it with with_json_as_string(true), the default"
+            .to_owned(),
+    )
 }
 
 /// JSON column payload, after the u64 serialization version.
@@ -1150,10 +1351,13 @@ async fn read_json_object_v2_column<R: ClickHouseRead>(
         let types = type_names
             .into_iter()
             .map(|name| {
-                let ct = wire_type(&name)?;
+                let ct = wire_type(&name, "JSON values", JSON_REMEDY)?;
                 Ok((name, ct))
             })
             .collect::<Result<Vec<(String, ColumnType)>>>()?;
+        for (name, ct) in &types {
+            refuse_unprintable(path_name, name, ct)?;
+        }
 
         path_sorted_types.push(types);
     }
@@ -1190,6 +1394,13 @@ async fn read_json_object_v2_column<R: ClickHouseRead>(
     let spilled = shared_offsets.last().copied().unwrap_or(0);
     read_column_at(reader, &ColumnType::String, spilled, depth + 1).await?;
     read_column_at(reader, &ColumnType::String, spilled, depth + 1).await?;
+    // Shared-data values are binary-encoded Dynamic values this decoder has no
+    // reader for, and dropping them would return a partial document.
+    if spilled > 0 {
+        return Err(json_spill_unsupported(
+            "paths past max_dynamic_paths (shared data)",
+        ));
+    }
 
     let mut path_cursors: Vec<Vec<usize>> = path_sorted_types
         .iter()
@@ -1201,9 +1412,7 @@ async fn read_json_object_v2_column<R: ClickHouseRead>(
     // collection, so there is nothing to iterate over.
     #[allow(clippy::needless_range_loop)]
     for row_i in 0..n {
-        let mut json = b"{".to_vec();
-        let mut first = true;
-
+        let mut pairs = Vec::new();
         for (path_idx, path_name) in path_names.iter().enumerate() {
             let disc = path_discriminators[path_idx][row_i] as usize;
             let k = path_sorted_types[path_idx].len();
@@ -1217,42 +1426,209 @@ async fn read_json_object_v2_column<R: ClickHouseRead>(
             path_cursors[path_idx][disc] += 1;
 
             let (type_name, col_type) = &path_sorted_types[path_idx][disc];
-            // SharedVariant spill values are an opaque binary encoding.
             if type_name == SHARED_VARIANT {
-                continue;
+                return Err(json_spill_unsupported(
+                    "values past max_dynamic_types (SharedVariant)",
+                ));
             }
-
-            if !first {
-                json.push(b',');
-            }
-            first = false;
-
-            json.extend_from_slice(&json_quote_bytes(path_name.as_bytes()));
-            json.push(b':');
-            json.extend_from_slice(&cell_to_json(
-                path_values[path_idx][disc].get(cursor),
-                col_type,
-            ));
+            let value = cell_to_json(path_values[path_idx][disc].get(cursor), col_type);
+            pairs.push((path_name.as_str(), value));
         }
-
-        json.push(b'}');
-        result.push(rowbinary_string(&json));
+        result.push(rowbinary_string(&nest_paths(pairs)?));
     }
 
     Ok(result)
 }
 
-/// `SharedVariant` spill values ride as a String sub-column; any other name the
-/// parser rejects would desynchronise the stream, so it fails loud.
-fn wire_type(name: &str) -> Result<ColumnType> {
+/// The refusal for a JSON value the server stored where the path-based
+/// serialisation carries it in a binary encoding this decoder does not read.
+fn json_spill_unsupported(what: &str) -> Error {
+    Error::Unsupported(format!(
+        "JSON {what} has no decoder in the path-based serialisation. \
+         Read it with with_json_as_string(true), the default"
+    ))
+}
+
+/// Refuse a path type the reader cannot print byte for byte as the server
+/// does: a date or time, which the server formats in its time zone, or an
+/// array of objects (`Array(JSON)`), whose own serialisation prefix the
+/// reader does not walk.
+fn refuse_unprintable(path: &str, type_name: &str, ct: &ColumnType) -> Result<()> {
+    if prints_like_the_server(ct) {
+        return Ok(());
+    }
+    Err(Error::Unsupported(format!(
+        "JSON path \"{path}\" holds {type_name}, which the path-based reader does not \
+         print the way the server does. Read it with with_json_as_string(true), the default"
+    )))
+}
+
+/// The same gate for a standalone `Dynamic` or `Variant` column, which has no
+/// string-mode setting to point at.
+fn refuse_unprintable_value(kind: &str, type_name: &str, ct: &ColumnType) -> Result<()> {
+    if prints_like_the_server(ct) {
+        return Ok(());
+    }
+    Err(Error::Unsupported(format!(
+        "{kind} values of type {type_name} are not printed the way the server prints them. \
+         Read the column cast to String in the query, as CAST(<column> AS String)"
+    )))
+}
+
+/// A readable name for a parsed type, for a refusal naming it.
+fn type_label(ct: &ColumnType) -> String {
+    match ct {
+        ColumnType::DateTime64 { precision, .. } => format!("DateTime64({precision})"),
+        ColumnType::Nullable(inner) => format!("Nullable({})", type_label(inner)),
+        ColumnType::Array(inner) => format!("Array({})", type_label(inner)),
+        other => format!("{other:?}"),
+    }
+}
+
+/// The types whose rendering here matches the server's: the scalars it infers
+/// from JSON, the narrower integers, `Float32`, and arrays of them.
+fn prints_like_the_server(ct: &ColumnType) -> bool {
+    match ct {
+        ColumnType::Bool
+        | ColumnType::Int8
+        | ColumnType::Int16
+        | ColumnType::Int32
+        | ColumnType::Int64
+        | ColumnType::UInt8
+        | ColumnType::UInt16
+        | ColumnType::UInt32
+        | ColumnType::UInt64
+        | ColumnType::Float32
+        | ColumnType::Float64
+        | ColumnType::String => true,
+        ColumnType::Nullable(inner) | ColumnType::Array(inner) => prints_like_the_server(inner),
+        _ => false,
+    }
+}
+
+/// A row's nested document: keys with either a value or more keys under them.
+enum Node {
+    Leaf(Vec<u8>),
+    Object(Vec<(String, Node)>),
+}
+
+fn write_object(children: &[(String, Node)], out: &mut Vec<u8>) {
+    out.push(b'{');
+    for (i, (key, node)) in children.iter().enumerate() {
+        if i > 0 {
+            out.push(b',');
+        }
+        out.extend_from_slice(&json_quote_bytes(key.as_bytes()));
+        out.push(b':');
+        match node {
+            Node::Leaf(value) => out.extend_from_slice(value),
+            Node::Object(grandchildren) => write_object(grandchildren, out),
+        }
+    }
+    out.push(b'}');
+}
+
+fn unnestable(path: &str, why: &str) -> Error {
+    Error::Unsupported(format!(
+        "JSON path \"{path}\" cannot be rebuilt as a document ({why}). \
+         Read it with with_json_as_string(true), the default"
+    ))
+}
+
+/// One row's `(path, JSON value)` pairs as the document the server prints for
+/// them: each path split on `.` into nested objects, siblings in the order of
+/// their full paths.
+fn nest_paths(mut pairs: Vec<(&str, Vec<u8>)>) -> Result<Vec<u8>> {
+    pairs.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    let mut root: Vec<(String, Node)> = Vec::new();
+    for (path, value) in pairs {
+        let segments: Vec<&str> = path.split('.').collect();
+        // `%2E` is the server's escape for a dot inside a key.
+        if segments
+            .iter()
+            .any(|s| s.is_empty() || s.to_ascii_uppercase().contains("%2E"))
+        {
+            return Err(unnestable(path, "a key holding a dot, or an empty key"));
+        }
+        let Some((last, parents)) = segments.split_last() else {
+            return Err(unnestable(path, "no key"));
+        };
+        let mut level = &mut root;
+        for seg in parents {
+            let i = if let Some(i) = level.iter().position(|(key, _)| key == seg) {
+                i
+            } else {
+                level.push(((*seg).to_owned(), Node::Object(Vec::new())));
+                level.len() - 1
+            };
+            level = match &mut level[i].1 {
+                Node::Object(children) => children,
+                Node::Leaf(_) => return Err(unnestable(path, "a value and an object at one key")),
+            };
+        }
+        if level.iter().any(|(key, _)| key == last) {
+            return Err(unnestable(path, "a value and an object at one key"));
+        }
+        level.push(((*last).to_owned(), Node::Leaf(value)));
+    }
+    let mut out = Vec::new();
+    write_object(&root, &mut out);
+    Ok(out)
+}
+
+/// What a JSON path refusal tells the caller to do instead.
+const JSON_REMEDY: &str = "Read it with with_json_as_string(true), the default";
+
+/// What a `Dynamic` or `Variant` refusal tells the caller to do instead.
+const CAST_REMEDY: &str =
+    "Read the column cast to String in the query, as CAST(<column> AS String)";
+
+/// Parse a type name the server announced inside a `Dynamic` or a JSON path,
+/// `kind` and `remedy` wording the refusal for one this decoder cannot
+/// represent. `SharedVariant` spill values ride as a String sub-column.
+///
+/// A name shaped like a server type is a legitimate value this decoder does
+/// not support, so it is [`Error::Unsupported`]. Anything else is a malformed
+/// response, [`Error::BadResponse`].
+fn wire_type(name: &str, kind: &str, remedy: &str) -> Result<ColumnType> {
     if name == SHARED_VARIANT {
         return Ok(ColumnType::String);
     }
     ColumnType::parse(name).ok_or_else(|| {
-        Error::BadResponse(format!(
-            "native protocol: unsupported nested column type '{name}'"
-        ))
+        if looks_like_a_type_name(name) {
+            Error::Unsupported(format!(
+                "{kind} of type {name} have no decoder here. {remedy}"
+            ))
+        } else {
+            Error::BadResponse(format!("native protocol: '{name}' is not a column type"))
+        }
     })
+}
+
+/// Whether `name` is spelled like a server type: a letter first, no control
+/// characters, and brackets that balance outside quotes.
+fn looks_like_a_type_name(name: &str) -> bool {
+    if !name.starts_with(|c: char| c.is_ascii_alphabetic()) || name.chars().any(char::is_control) {
+        return false;
+    }
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for c in name.chars() {
+        match (quote, c) {
+            (Some(_), _) if escaped => escaped = false,
+            (Some(_), '\\') => escaped = true,
+            (Some(q), c) if c == q => quote = None,
+            (None, '\'' | '`') => quote = Some(c),
+            (None, '(') => depth += 1,
+            (None, ')') => match depth.checked_sub(1) {
+                Some(d) => depth = d,
+                None => return false,
+            },
+            _ => {}
+        }
+    }
+    depth == 0 && quote.is_none()
 }
 
 /// JSON FLATTENED object column reader, after the u64 version has been
@@ -1280,7 +1656,7 @@ async fn read_json_object_flattened_column<R: ClickHouseRead>(
     }
 
     let mut path_col_types: Vec<Vec<ColumnType>> = with_cap(num_paths)?;
-    for _ in 0..num_paths {
+    for path_name in &path_names {
         // Each path opens with the flattened Dynamic version before its types.
         let dyn_version = reader.read_u64_le().await?;
         if dyn_version != DYNAMIC_FLATTENED {
@@ -1288,7 +1664,12 @@ async fn read_json_object_flattened_column<R: ClickHouseRead>(
                 "native protocol: unexpected Dynamic version {dyn_version} in a JSON v3 path"
             )));
         }
-        path_col_types.push(read_flat_wire_types(reader).await?);
+        let mut types = Vec::new();
+        for (name, ct) in read_flat_wire_types(reader, "JSON values", JSON_REMEDY).await? {
+            refuse_unprintable(path_name, &name, &ct)?;
+            types.push(ct);
+        }
+        path_col_types.push(types);
     }
 
     let mut path_discriminators: Vec<Vec<usize>> = with_cap(num_paths)?;
@@ -1318,9 +1699,7 @@ async fn read_json_object_flattened_column<R: ClickHouseRead>(
     // collection, so there is nothing to iterate over.
     #[allow(clippy::needless_range_loop)]
     for row_i in 0..n {
-        let mut json = b"{".to_vec();
-        let mut first = true;
-
+        let mut pairs = Vec::new();
         for (path_idx, path_name) in path_names.iter().enumerate() {
             let disc = path_discriminators[path_idx][row_i];
             // NULL is the type count itself in v3, so the key is omitted.
@@ -1331,21 +1710,13 @@ async fn read_json_object_flattened_column<R: ClickHouseRead>(
             let cursor = path_cursors[path_idx][disc];
             path_cursors[path_idx][disc] += 1;
 
-            if !first {
-                json.push(b',');
-            }
-            first = false;
-
-            json.extend_from_slice(&json_quote_bytes(path_name.as_bytes()));
-            json.push(b':');
-            json.extend_from_slice(&cell_to_json(
+            let value = cell_to_json(
                 path_values[path_idx][disc].get(cursor),
                 &path_col_types[path_idx][disc],
-            ));
+            );
+            pairs.push((path_name.as_str(), value));
         }
-
-        json.push(b'}');
-        result.push(rowbinary_string(&json));
+        result.push(rowbinary_string(&nest_paths(pairs)?));
     }
 
     Ok(result)
@@ -1353,12 +1724,17 @@ async fn read_json_object_flattened_column<R: ClickHouseRead>(
 
 /// Read a flattened Dynamic type list, which carries no `SharedVariant` and is
 /// indexed in declaration order, so the whole 255-slot range is concrete types.
-async fn read_flat_wire_types<R: ClickHouseRead>(reader: &mut R) -> Result<Vec<ColumnType>> {
+async fn read_flat_wire_types<R: ClickHouseRead>(
+    reader: &mut R,
+    kind: &str,
+    remedy: &str,
+) -> Result<Vec<(String, ColumnType)>> {
     let count = read_capped_count(reader, MAX_VARIANT_TYPES, "Dynamic type").await?;
     let mut types = with_cap(count)?;
     for _ in 0..count {
         let name = reader.read_utf8_string().await?;
-        types.push(wire_type(&name)?);
+        let ct = wire_type(&name, kind, remedy)?;
+        types.push((name, ct));
     }
     Ok(types)
 }
@@ -1447,6 +1823,18 @@ async fn read_dynamic_v1v2_column<R: ClickHouseRead>(
 /// The type list a `Dynamic` column's data phase is read against.
 pub(crate) struct DynamicHeader {
     type_names: Vec<String>,
+    /// The flattened serialisation, whose type list is read with the data.
+    flattened: bool,
+}
+
+impl DynamicHeader {
+    /// The prefix of a flattened `Dynamic`, which carries only its version.
+    pub(crate) fn flattened() -> Self {
+        Self {
+            type_names: Vec::new(),
+            flattened: true,
+        }
+    }
 }
 
 /// The prefix half of a v1/v2 `Dynamic` column: the type list, then the inner
@@ -1478,7 +1866,10 @@ pub(crate) async fn read_dynamic_v1v2_prefix<R: ClickHouseRead>(
 
     read_variant_mode(reader).await?;
 
-    Ok(DynamicHeader { type_names })
+    Ok(DynamicHeader {
+        type_names,
+        flattened: false,
+    })
 }
 
 /// The data half of a v1/v2 `Dynamic` column, read against the type list its
@@ -1493,11 +1884,20 @@ pub(crate) async fn read_dynamic_v1v2_body<R: ClickHouseRead>(
     header: &DynamicHeader,
     depth: usize,
 ) -> Result<ColumnData> {
+    if header.flattened {
+        return read_dynamic_flattened_column(reader, n, depth).await;
+    }
     let type_names = &header.type_names;
     let col_types = type_names
         .iter()
-        .map(|name| wire_type(name))
+        .map(|name| wire_type(name, "Dynamic values", CAST_REMEDY))
         .collect::<Result<Vec<ColumnType>>>()?;
+    // SharedVariant has its own refusal, per value, below.
+    for (name, ct) in type_names.iter().zip(&col_types) {
+        if name != SHARED_VARIANT {
+            refuse_unprintable_value("Dynamic", name, ct)?;
+        }
+    }
 
     let k = col_types.len();
     let discriminators = read_exact_grown(reader, n).await?;
@@ -1523,12 +1923,15 @@ pub(crate) async fn read_dynamic_v1v2_body<R: ClickHouseRead>(
         } else {
             let cursor = type_cursors[idx];
             type_cursors[idx] += 1;
-            // SharedVariant spill values are an opaque binary encoding.
+            // Reading a SharedVariant value as null would drop it unseen.
             if type_names[idx] == SHARED_VARIANT {
-                b"null".to_vec()
-            } else {
-                cell_to_json(type_values[idx].get(cursor), &col_types[idx])
+                return Err(Error::Unsupported(
+                    "Dynamic values past max_types (SharedVariant) have no decoder here. \
+                     Read the column cast to String in the query, as CAST(<column> AS String)"
+                        .to_owned(),
+                ));
             }
+            cell_to_json(type_values[idx].get(cursor), &col_types[idx])
         };
         result.push(rowbinary_string(&json_bytes));
     }
@@ -1545,7 +1948,11 @@ async fn read_dynamic_flattened_column<R: ClickHouseRead>(
     n: usize,
     depth: usize,
 ) -> Result<ColumnData> {
-    let col_types = read_flat_wire_types(reader).await?;
+    let mut col_types = Vec::new();
+    for (name, ct) in read_flat_wire_types(reader, "Dynamic values", CAST_REMEDY).await? {
+        refuse_unprintable_value("Dynamic", &name, &ct)?;
+        col_types.push(ct);
+    }
     let total_types = col_types.len();
     let (discriminators, type_counts) =
         read_discriminators(reader, n, total_types, index_width(total_types)).await?;
@@ -1598,6 +2005,13 @@ fn rowbinary_to_json_inner(bytes: &[u8], col_type: &ColumnType) -> Result<(Vec<u
 
     Ok(match col_type {
         ColumnType::UInt8 => fixed!(1, u8),
+        ColumnType::Bool => {
+            let byte = head::<1>(bytes)?[0];
+            (
+                (if byte == 0 { &b"false"[..] } else { b"true" }).to_vec(),
+                1,
+            )
+        }
         ColumnType::UInt16 | ColumnType::Date => fixed!(2, u16),
         ColumnType::UInt32 | ColumnType::Time => fixed!(4, u32),
         ColumnType::UInt64 => fixed!(8, u64),
@@ -1625,7 +2039,7 @@ fn rowbinary_to_json_inner(bytes: &[u8], col_type: &ColumnType) -> Result<(Vec<u
         }
         ColumnType::Float32 => {
             let v = f32::from_le_bytes(head::<4>(bytes)?);
-            (format_float_json(f64::from(v)).into_bytes(), 4)
+            (format_f32_json(v).into_bytes(), 4)
         }
         ColumnType::Float64 => {
             let v = f64::from_le_bytes(head::<8>(bytes)?);
@@ -1756,7 +2170,10 @@ fn rowbinary_to_json_inner(bytes: &[u8], col_type: &ColumnType) -> Result<(Vec<u
         }
         // Dynamic, Variant and JSON cells already hold JSON text, length-
         // prefixed as RowBinary strings, so they are spliced in verbatim.
-        ColumnType::Dynamic | ColumnType::NewJson | ColumnType::Variant(_) => {
+        ColumnType::Dynamic
+        | ColumnType::NewJson
+        | ColumnType::TypedJson
+        | ColumnType::Variant(_) => {
             let (len, hdr) = slice_var_uint(bytes)?;
             let end = usize::try_from(len)
                 .ok()
@@ -1779,47 +2196,73 @@ fn head<const N: usize>(bytes: &[u8]) -> Result<[u8; N], ()> {
     bytes.get(..N).ok_or(())?.try_into().map_err(|_| ())
 }
 
-/// Format a float for JSON; NaN and infinity have no JSON form and render as
-/// `null`.
+/// Format a float as the server prints one in JSON: the shortest digits that
+/// round-trip, in plain decimal for exponents -6 to 20 and as `1e21` outside
+/// them. NaN and infinity have no JSON form and render as `null`.
 fn format_float_json(v: f64) -> String {
-    if v.is_nan() || v.is_infinite() {
-        "null".to_string()
+    if v.is_finite() {
+        server_notation(format!("{v}"), format!("{v:e}"))
     } else {
-        format!("{v}")
+        "null".to_string()
     }
 }
 
-/// JSON-quote raw bytes as a UTF-8 string (or escaped if not valid UTF-8).
+/// [`format_float_json`] for a `Float32`, from its own shortest digits rather
+/// than those of the widened `f64`.
+fn format_f32_json(v: f32) -> String {
+    if v.is_finite() {
+        server_notation(format!("{v}"), format!("{v:e}"))
+    } else {
+        "null".to_string()
+    }
+}
+
+/// Pick the plain or the scientific spelling of one float the way the server
+/// does, by its decimal exponent.
+fn server_notation(plain: String, scientific: String) -> String {
+    let exponent: i32 = scientific
+        .rsplit_once('e')
+        .and_then(|(_, e)| e.parse().ok())
+        .unwrap_or(0);
+    if (-6..21).contains(&exponent) {
+        plain
+    } else {
+        scientific
+    }
+}
+
+/// JSON-quote raw bytes with the escapes the server writes: `/` and the line
+/// and paragraph separators included, control bytes as upper-case `\u00XX`.
 fn json_quote_bytes(bytes: &[u8]) -> Vec<u8> {
     let mut out = vec![b'"'];
-    for &b in bytes {
-        match b {
-            b'"' => {
-                out.push(b'\\');
-                out.push(b'"');
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let escape: Option<&[u8]> = match b {
+            b'"' => Some(br#"\""#),
+            b'\\' => Some(br"\\"),
+            b'/' => Some(br"\/"),
+            0x08 => Some(br"\b"),
+            0x0c => Some(br"\f"),
+            b'\n' => Some(br"\n"),
+            b'\r' => Some(br"\r"),
+            b'\t' => Some(br"\t"),
+            _ => None,
+        };
+        match (escape, bytes.get(i..i + 3)) {
+            (Some(escaped), _) => out.extend_from_slice(escaped),
+            (None, Some([0xe2, 0x80, 0xa8])) => {
+                out.extend_from_slice(br"\u2028");
+                i += 2;
             }
-            b'\\' => {
-                out.push(b'\\');
-                out.push(b'\\');
+            (None, Some([0xe2, 0x80, 0xa9])) => {
+                out.extend_from_slice(br"\u2029");
+                i += 2;
             }
-            b'\n' => {
-                out.push(b'\\');
-                out.push(b'n');
-            }
-            b'\r' => {
-                out.push(b'\\');
-                out.push(b'r');
-            }
-            b'\t' => {
-                out.push(b'\\');
-                out.push(b't');
-            }
-            0x00..=0x1f => {
-                // Control character -- escape as \uXXXX
-                out.extend_from_slice(format!("\\u{b:04x}").as_bytes());
-            }
-            _ => out.push(b),
+            (None, _) if b < 0x20 => out.extend_from_slice(format!("\\u{b:04X}").as_bytes()),
+            (None, _) => out.push(b),
         }
+        i += 1;
     }
     out.push(b'"');
     out
@@ -1850,12 +2293,51 @@ mod tests {
         assert!(ColumnType::parse(&deep).is_none());
     }
 
+    /// `(type name, parses)`, spelled the way `system.columns` and an INSERT's
+    /// schema block report each type.
     #[test]
-    fn parse_accepts_realistic_nesting() {
-        assert!(
-            ColumnType::parse("Array(Map(String, Tuple(UInt8, Array(Nullable(String)))))")
-                .is_some()
-        );
+    fn parse_takes_the_server_spellings_and_refuses_the_rest() {
+        let cases: &[(&str, bool)] = &[
+            (
+                "Array(Map(String, Tuple(UInt8, Array(Nullable(String)))))",
+                true,
+            ),
+            ("JSON", true),
+            ("JSON(max_dynamic_paths=2048)", true),
+            (
+                "JSON(max_dynamic_types=8, max_dynamic_paths=16, SKIP `x.y`, SKIP REGEXP 'z.*')",
+                true,
+            ),
+            // A comma inside a quoted pattern is not an argument separator.
+            ("JSON(SKIP REGEXP 'a,b')", true),
+            ("JSON(SKIP REGEXP 'k=v')", true),
+            ("Nullable(JSON(max_dynamic_paths=2048))", true),
+            ("Array(JSON(max_dynamic_paths=2048))", true),
+            (
+                "Map(LowCardinality(String), JSON(max_dynamic_paths=2048))",
+                true,
+            ),
+            ("Object('json')", true),
+            // Typed paths parse, as `TypedJson`.
+            ("JSON(`a.b` UInt32)", true),
+            ("JSON(a UInt32, max_dynamic_paths=2048)", true),
+            ("JSON(`a.b` Enum8('x' = 1))", true),
+            ("Array(JSON(`a` String))", true),
+            ("JSON(max_dynamic_paths=lots)", false),
+            ("JSON(max_dynamic_paths=2048", false),
+            ("JSON(unknown_param=1)", false),
+            ("JSON(`a.b`)", false),
+            ("JSON(`a.b UInt32)", false),
+            ("NotAType", false),
+            ("Map(String)", false),
+        ];
+        for (type_name, parses) in cases {
+            assert_eq!(
+                ColumnType::parse(type_name).is_some(),
+                *parses,
+                "{type_name}"
+            );
+        }
     }
 
     #[test]
@@ -1982,9 +2464,219 @@ mod tests {
             ("Dynamic", dynamic_v3_payload(), 2),
             ("JSON", json_v3_payload(), 2),
             ("JSON", json_v2_payload(&[]), 2),
-            // The same block with one row spilled into shared data.
-            ("JSON", json_v2_payload(&[("x", "1")]), 2),
         ]
+    }
+
+    /// Scalars render as the server prints them in JSON, each pinned against
+    /// its output: notation edges, escapes and `Bool`.
+    #[test]
+    fn scalars_render_as_the_server_prints_them() {
+        for (v, want) in [
+            (1.5, "1.5"),
+            (0.000_001, "0.000001"),
+            (1e-7, "1e-7"),
+            (1e20, "100000000000000000000"),
+            (1e21, "1e21"),
+            (1e300, "1e300"),
+            (1.234_567_890_123_456_8e29, "1.2345678901234568e29"),
+            (-0.0, "-0"),
+            (f64::NAN, "null"),
+        ] {
+            assert_eq!(format_float_json(v), want, "{v:e}");
+        }
+        // Float32 from its own shortest digits: widened, 0.1 reads 0.10000000149011612.
+        for (v, want) in [(0.1f32, "0.1"), (1e-7, "1e-7"), (3.4e38, "3.4e38")] {
+            assert_eq!(format_f32_json(v), want, "{v:e}");
+        }
+        for (raw, want) in [
+            ("q\"b\\s/n", r#""q\"b\\s\/n""#),
+            ("\u{8}\u{c}\r\n\t", r#""\b\f\r\n\t""#),
+            ("\u{1}\u{1f}\u{7f}", "\"\\u0001\\u001F\u{7f}\""),
+            ("\u{2028}\u{2029}", r#""\u2028\u2029""#),
+            ("\u{fc}", "\"\u{fc}\""),
+        ] {
+            assert_eq!(
+                String::from_utf8(json_quote_bytes(raw.as_bytes())).unwrap(),
+                want,
+                "{raw:?}"
+            );
+        }
+        for (byte, want) in [(0u8, "false"), (1, "true")] {
+            assert_eq!(
+                rowbinary_to_json(&[byte], &ColumnType::Bool),
+                want.as_bytes()
+            );
+        }
+        assert!(matches!(ColumnType::parse("Bool"), Some(ColumnType::Bool)));
+        assert!(matches!(
+            ColumnType::parse("Array(Nullable(Bool))"),
+            Some(ColumnType::Array(_))
+        ));
+    }
+
+    /// `(paths and values, document)`, the document `None` where the paths
+    /// have no faithful nesting.
+    #[test]
+    fn paths_nest_the_way_the_server_prints_them() {
+        let cases: &[(&[(&str, &str)], Option<&str>)] = &[
+            (&[], Some("{}")),
+            (&[("a", "1")], Some(r#"{"a":1}"#)),
+            (&[("a.b", "1")], Some(r#"{"a":{"b":1}}"#)),
+            (
+                &[("e", "2"), ("a.d", r#""x""#), ("a.b.c", "1")],
+                Some(r#"{"a":{"b":{"c":1},"d":"x"},"e":2}"#),
+            ),
+            // Full-path order: `a.b-` sorts ahead of `a.b.x`.
+            (
+                &[("a.b.x", "1"), ("a.b-", "2")],
+                Some(r#"{"a":{"b-":2,"b":{"x":1}}}"#),
+            ),
+            (&[("a", "1"), ("a.b", "2")], None),
+            (&[("a.b", "1"), ("a.b.c", "2")], None),
+            (&[("a%2Eb", "1")], None),
+            (&[("a..b", "1")], None),
+            (&[(".a", "1")], None),
+        ];
+        for (pairs, want) in cases {
+            let pairs = pairs
+                .iter()
+                .map(|(p, v)| (*p, v.as_bytes().to_vec()))
+                .collect();
+            let got = nest_paths(pairs);
+            match (want, &got) {
+                (Some(want), Ok(doc)) => assert_eq!(doc, want.as_bytes(), "{want}"),
+                (None, Err(Error::Unsupported(msg))) => {
+                    assert!(msg.contains("with_json_as_string(true)"), "{msg}");
+                }
+                _ => panic!("{want:?}: got {got:?}"),
+            }
+        }
+    }
+
+    /// A typed-path column reads in the string form and refuses the path-based
+    /// one, whose typed sub-columns it does not decode.
+    #[tokio::test]
+    async fn typed_json_reads_as_text_and_refuses_paths() {
+        let mut text = 1u64.to_le_bytes().to_vec();
+        text.extend_from_slice(&[7, b'{', b'"', b'a', b'"', b':', b'1', b'}']);
+        let cells = read_column(&mut std::io::Cursor::new(text), &ColumnType::TypedJson, 1)
+            .await
+            .expect("the string form reads");
+        assert_eq!(cells, [rowbinary_string(br#"{"a":1}"#)]);
+
+        let err = read_column(
+            &mut std::io::Cursor::new(json_v2_payload(&[])),
+            &ColumnType::TypedJson,
+            2,
+        )
+        .await
+        .expect_err("the path-based form is refused");
+        assert!(
+            matches!(&err, Error::Unsupported(m) if m.contains("typed paths")),
+            "{err}"
+        );
+    }
+
+    /// `(announced type, unsupported)`: a name spelled like a server type that
+    /// the parser cannot represent is an unsupported value, anything else a
+    /// malformed response.
+    #[test]
+    fn an_unparsed_type_name_is_unsupported_only_when_well_formed() {
+        for (name, unsupported) in [
+            ("Tuple(x UInt8)", true),
+            ("IntervalSecond", true),
+            ("Tuple(s Enum8('a)' = 1))", true),
+            ("Tuple(x UInt8", false),
+            ("Tuple(x))", false),
+            ("Foo('a)", false),
+            ("9Int", false),
+            ("", false),
+            ("Int\u{1}", false),
+        ] {
+            match wire_type(name, "Dynamic values", CAST_REMEDY) {
+                Err(Error::Unsupported(m)) if unsupported => {
+                    assert!(m.contains(name) && m.contains("AS String)"), "{m}");
+                }
+                Err(Error::BadResponse(_)) if !unsupported => {}
+                other => panic!("{name:?}: {other:?}"),
+            }
+        }
+    }
+
+    /// A JSON path whose announced type the parser cannot represent is
+    /// refused as unsupported, with the server's spelling, in both
+    /// path-based serialisations.
+    #[tokio::test]
+    async fn a_json_path_of_an_unparsed_type_is_unsupported() {
+        const NAME: &[u8] = b"IntervalSecond";
+        let respelt = |wire: Vec<u8>| {
+            let uint8 = [5, b'U', b'I', b'n', b't', b'8'];
+            let at = wire
+                .windows(uint8.len())
+                .position(|w| w == uint8)
+                .expect("the payload declares UInt8");
+            let mut out = wire[..at].to_vec();
+            out.push(u8::try_from(NAME.len()).unwrap());
+            out.extend_from_slice(NAME);
+            out.extend_from_slice(&wire[at + uint8.len()..]);
+            out
+        };
+        for wire in [respelt(json_v2_payload(&[])), respelt(json_v3_payload())] {
+            let err = read_column(&mut std::io::Cursor::new(wire), &ColumnType::NewJson, 2)
+                .await
+                .expect_err("an unparsed path type is refused");
+            assert!(
+                matches!(&err, Error::Unsupported(m)
+                    if m.contains("IntervalSecond") && m.contains("with_json_as_string(true)")),
+                "{err:?}"
+            );
+        }
+    }
+
+    /// A V2 value the server moved out of its typed storage is refused with the
+    /// remedy, never dropped or read as null.
+    #[tokio::test]
+    async fn a_spilled_v2_value_is_refused_not_dropped() {
+        // Row 0 points at SharedVariant (index 0), whose String sub-column
+        // carries one opaque value ahead of the now-empty UInt8 one.
+        let into_shared_variant = |mut wire: Vec<u8>, tail: usize| {
+            let at = wire.len() - tail;
+            wire.splice(at..at + 3, [0, 255, 2, 0x0a, 0x01]);
+            wire
+        };
+        let cases = [
+            (
+                ColumnType::NewJson,
+                "shared data",
+                "with_json_as_string(true)",
+                json_v2_payload(&[("x", "1")]),
+            ),
+            // The discriminators sit ahead of one UInt8 byte and two u64 offsets.
+            (
+                ColumnType::NewJson,
+                "SharedVariant",
+                "with_json_as_string(true)",
+                into_shared_variant(json_v2_payload(&[]), 19),
+            ),
+            // Here only the UInt8 byte follows them.
+            (
+                ColumnType::Dynamic,
+                "SharedVariant",
+                "AS String)",
+                into_shared_variant(dynamic_v2_payload(), 3),
+            ),
+        ];
+        for (col_type, what, remedy, wire) in cases {
+            let mut cursor = std::io::Cursor::new(wire);
+            let err = read_column(&mut cursor, &col_type, 2)
+                .await
+                .expect_err(what);
+            let msg = err.to_string();
+            assert!(
+                matches!(err, Error::Unsupported(_)) && msg.contains(what) && msg.contains(remedy),
+                "{col_type:?} {what}: {msg}"
+            );
+        }
     }
 
     /// JSON v2: version, one path, its Dynamic v2 header, discriminators and

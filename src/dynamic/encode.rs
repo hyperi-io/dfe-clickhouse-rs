@@ -377,12 +377,13 @@ fn encode_typed(
                 .ok_or_else(|| enc_err(col, "Map without key/value types"))?;
             encode_map(value, kt, vt, col, buf)?;
         }
+        TypeTag::Point => encode_point(value, col, buf)?,
         TypeTag::JSON => {
             // JSON goes on the wire as a length-prefixed String of JSON text. A
             // Value::String is already that text, so it is written verbatim.
-            // Missing and empty become `{}`: the column's JSON parser rejects
-            // the text `null` and empty input (code 117), and JSON cannot be
-            // Nullable. A root-level array is wrapped -- see `wrap_root_array`.
+            // Missing and empty become `{}`, because the column's JSON parser
+            // rejects the text `null` and empty input (code 117). A root-level
+            // array is wrapped -- see `wrap_root_array`.
             let json_bytes = match value {
                 Value::Null => Cow::Borrowed("{}".as_bytes()),
                 Value::String(s) if s.is_empty() => Cow::Borrowed("{}".as_bytes()),
@@ -392,13 +393,34 @@ fn encode_typed(
             };
             buf.put_string(&json_bytes);
         }
-        // Geo, Variant, Dynamic, Tuple and anything the parser did not
-        // recognise have no encoding here. Reject rather than write bytes the
-        // server would read as a different value.
-        TypeTag::Point | TypeTag::Variant | TypeTag::Dynamic | TypeTag::Unknown => {
+        // Variant, Dynamic, Tuple and anything the parser did not recognise
+        // have no encoding here. Reject rather than write bytes the server
+        // would read as a different value.
+        TypeTag::Variant | TypeTag::Dynamic | TypeTag::Unknown => {
             return Err(unsupported(col, pt));
         }
     }
+    Ok(())
+}
+
+/// A `Point` as `RowBinary`: x then y, each a little-endian `Float64`.
+///
+/// Takes a `[x, y]` pair, the GeoJSON order, or the `{"lat", "lon"}` object an
+/// Elastic `geo_point` carries, with longitude as x.
+fn encode_point(value: &Value, col: &str, buf: &mut Vec<u8>) -> Result<(), DynamicError> {
+    let (x, y) = match value {
+        Value::Array(pair) => match pair.as_slice() {
+            [x, y] => (x, y),
+            _ => return Err(enc_err(col, "Point needs exactly two coordinates")),
+        },
+        Value::Object(obj) => match (obj.get("lon"), obj.get("lat")) {
+            (Some(lon), Some(lat)) => (lon, lat),
+            _ => return Err(enc_err(col, "Point object needs both lat and lon")),
+        },
+        _ => return Err(enc_err(col, "Point needs [x, y] or {lat, lon}")),
+    };
+    buf.extend_from_slice(&as_f64(x, col)?.to_le_bytes());
+    buf.extend_from_slice(&as_f64(y, col)?.to_le_bytes());
     Ok(())
 }
 
@@ -423,13 +445,18 @@ fn write_default(pt: &ParsedType, col: &str, buf: &mut Vec<u8>) -> Result<(), Dy
         return Ok(());
     }
     match pt.tag {
-        // JSON's no-value is the empty object: the column parser rejects empty
-        // input (code 117) and JSON cannot be Nullable.
+        // JSON's no-value is the empty object, because the column parser
+        // rejects empty input (code 117).
         TypeTag::JSON => {
             buf.put_string(b"{}");
             return Ok(());
         }
-        TypeTag::Point | TypeTag::Variant | TypeTag::Dynamic | TypeTag::Unknown => {
+        // The origin, two zero `Float64`s.
+        TypeTag::Point => {
+            buf.resize(buf.len() + 16, 0);
+            return Ok(());
+        }
+        TypeTag::Variant | TypeTag::Dynamic | TypeTag::Unknown => {
             return Err(unsupported(col, pt));
         }
         _ => {}
@@ -1633,6 +1660,48 @@ mod tests {
         assert_eq!(bytes, expected);
     }
 
+    // ---- Point ----
+
+    /// `(value, x, y)`: a GeoJSON-ordered `[x, y]` pair, and the `{lat, lon}`
+    /// object an Elastic `geo_point` carries, longitude as x.
+    #[test]
+    fn point_takes_a_pair_or_a_lat_lon_object() {
+        let cases = [
+            (json!([1.5, -2.5]), 1.5f64, -2.5f64),
+            (json!([151, -33]), 151.0, -33.0),
+            (json!({"lat": -33.86, "lon": 151.21}), 151.21, -33.86),
+            (json!({"lon": "151.21", "lat": "-33.86"}), 151.21, -33.86),
+        ];
+        for (value, x, y) in cases {
+            let want = [x.to_le_bytes(), y.to_le_bytes()].concat();
+            assert_eq!(
+                enc(json!({ "p": value }), &[("p", "Point")]),
+                want,
+                "{value}"
+            );
+        }
+        // Absent from the row: the origin, as any other non-Nullable default.
+        assert_eq!(enc(json!({}), &[("p", "Point")]), vec![0u8; 16]);
+    }
+
+    #[test]
+    fn point_refuses_anything_that_is_not_two_coordinates() {
+        for value in [
+            json!([1.0]),
+            json!([1.0, 2.0, 3.0]),
+            json!(["a", 2.0]),
+            json!({"lat": 1.0}),
+            json!("POINT(1 2)"),
+            json!(7),
+        ] {
+            let err = enc_err_of(json!({ "p": value }), &[("p", "Point")]);
+            assert!(
+                matches!(err, DynamicError::EncodingError { .. }),
+                "{value}: {err:?}"
+            );
+        }
+    }
+
     // ---- JSON ----
 
     #[test]
@@ -1826,15 +1895,6 @@ mod tests {
     }
 
     #[test]
-    fn point_is_unsupported() {
-        let e = enc_err_of(json!({"p": [1.0, 2.0]}), &[("p", "Point")]);
-        assert!(
-            matches!(e, DynamicError::UnsupportedType { .. }),
-            "got: {e:?}"
-        );
-    }
-
-    #[test]
     fn dynamic_is_unsupported() {
         let e = enc_err_of(json!({"d": 1}), &[("d", "Dynamic")]);
         assert!(
@@ -1847,7 +1907,12 @@ mod tests {
     /// so the absent-value default path has to reject it too.
     #[test]
     fn an_unsupported_column_errors_whether_or_not_the_row_has_it() {
-        for ty in ["Point", "Variant(UInt8, String)", "Dynamic", "NotAType"] {
+        for ty in [
+            "Variant(UInt8, String)",
+            "Dynamic",
+            "NotAType",
+            "JSON(max_dynamic_paths=lots)",
+        ] {
             let with_value = enc_err_of(json!({"c": 1}), &[("c", ty)]);
             assert!(
                 matches!(with_value, DynamicError::UnsupportedType { .. }),
@@ -2116,6 +2181,8 @@ mod tests {
         "Map(String, UInt32)",
         "Map(UInt32, String)",
         "JSON",
+        "JSON(max_dynamic_paths=2048)",
+        "Nullable(JSON)",
         "Nullable(String)",
         "Nullable(DateTime64(3))",
         "LowCardinality(Nullable(String))",

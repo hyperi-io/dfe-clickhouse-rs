@@ -370,7 +370,8 @@ mod tests {
         control.shutdown().await.unwrap();
     }
 
-    #[tokio::test]
+    // Paused time: on a loaded host a real 120 ms sleep can see two 20 ms ticks.
+    #[tokio::test(start_paused = true)]
     async fn idle_ticks_fire_when_quiet() {
         let idle_ticks = Arc::new(AtomicU64::new(0));
         let control = spawn(
@@ -469,7 +470,8 @@ mod tests {
         assert_send_sync::<SendError<()>>();
     }
 
-    #[tokio::test]
+    // Paused time: the sleep below completes only once the worker has run.
+    #[tokio::test(start_paused = true)]
     async fn worker_panic_surfaces_as_join_error() {
         // Runner does not catch panics; they exit the worker task and
         // surface to the caller via `JoinHandle` -> `JoinError`.

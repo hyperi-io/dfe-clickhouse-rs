@@ -239,6 +239,20 @@ impl ParsedType {
             break;
         }
 
+        // Typed paths included: an insert sends JSON as text on both transports.
+        if let Some(args) = Self::extract_wrapper(&type_str, "JSON") {
+            result.base = "JSON".to_string();
+            if crate::native::columns::json_args(&args).is_some() {
+                result.tag = TypeTag::JSON;
+            }
+            return result;
+        }
+        if type_str == "Object('json')" {
+            result.base = "Object".to_string();
+            result.tag = TypeTag::JSON;
+            return result;
+        }
+
         if let Some(inner) = Self::extract_wrapper(&type_str, "Array") {
             result.base = "Array".to_string();
             result.tag = TypeTag::Array;
@@ -454,6 +468,20 @@ impl ParsedType {
     #[must_use]
     pub fn is_ip(&self) -> bool {
         matches!(self.category(), "IPv4" | "IPv6")
+    }
+
+    /// Whether JSON appears anywhere in this type, an `Array(JSON)` element or
+    /// a `Map` value included.
+    pub(crate) fn contains_json(&self) -> bool {
+        self.tag == TypeTag::JSON
+            || self
+                .array_element
+                .as_ref()
+                .is_some_and(|e| e.contains_json())
+            || self
+                .map_types
+                .as_ref()
+                .is_some_and(|(k, v)| k.contains_json() || v.contains_json())
     }
 
     /// Byte size of this type's fixed-width representation, if applicable.
@@ -738,6 +766,35 @@ mod tests {
             let d = ParsedType::parse(raw);
             assert_eq!(d.base, "Dynamic", "failed for {raw}");
             assert_eq!(d.tag, TypeTag::Dynamic, "failed for {raw}");
+        }
+    }
+
+    /// `(server type, tag, nullable)`. Typed paths tag as JSON, because both
+    /// transports insert JSON as text.
+    #[test]
+    fn json_with_parameters_tags_as_json() {
+        for (raw, tag, nullable) in [
+            ("JSON", TypeTag::JSON, false),
+            ("JSON(max_dynamic_paths=2048)", TypeTag::JSON, false),
+            (
+                "Nullable(JSON(max_dynamic_paths=2048))",
+                TypeTag::JSON,
+                true,
+            ),
+            (
+                "JSON(max_dynamic_types=8, SKIP `x.y`)",
+                TypeTag::JSON,
+                false,
+            ),
+            ("Object('json')", TypeTag::JSON, false),
+            ("JSON(`a.b` UInt32)", TypeTag::JSON, false),
+            ("JSON(unknown_param=1)", TypeTag::Unknown, false),
+            ("JSON(max_dynamic_paths=x)", TypeTag::Unknown, false),
+        ] {
+            let t = ParsedType::parse(raw);
+            assert_eq!(t.tag, tag, "{raw}");
+            assert_eq!(t.nullable, nullable, "{raw}");
+            assert_eq!(t.raw, raw, "{raw}");
         }
     }
 

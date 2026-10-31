@@ -30,8 +30,8 @@ use crate::tcp::retry::RetryPolicy;
 mod settings {
     pub(super) const DATABASE: &str = "database";
     pub(super) const ROLE: &str = "role";
-    /// Makes the server emit JSON columns as String in Native output; the
-    /// block decoder has no reader for the path-based serialisation.
+    /// Makes the server emit JSON columns as String in Native output, which
+    /// reads every JSON column the path-based serialisation refuses.
     pub(super) const JSON_AS_STRING: &str = "output_format_native_write_json_as_string";
 }
 
@@ -86,13 +86,24 @@ impl TcpClient {
         this
     }
 
-    /// Open a TLS-over-TCP client. `server_name` is the SNI / cert name.
+    /// Open a TLS-over-TCP client. `server_name` is the SNI and the name the
+    /// certificate is verified against.
+    ///
+    /// When `server_name` is `addr`'s own host, every endpoint is verified
+    /// against its own host, those [`Self::with_addrs`] adds included, so
+    /// failing over to a second host verifies that host's certificate. Any
+    /// other name is kept for every endpoint, for a caller connecting by
+    /// address to a certificate issued to a name.
     #[cfg(feature = "tls")]
     #[must_use]
     pub fn new_tls(addr: impl Into<String>, server_name: impl Into<String>) -> Self {
+        let addr = addr.into();
+        let server_name = server_name.into();
+        let host = crate::tcp::connect::endpoint_host(&addr);
+        let explicit = (!server_name.eq_ignore_ascii_case(host)).then_some(server_name);
         let mut this = Self::new(addr);
         this.config.kind = crate::tcp::pool::ConnectKindConfig::Tls {
-            server_name: server_name.into(),
+            server_name: explicit,
         };
         this.discard_pool();
         this
@@ -160,8 +171,12 @@ impl TcpClient {
     }
 
     /// Ask the server to send JSON columns as String, which is the default.
-    /// Turning it off yields the path-based JSON serialisation, which
-    /// [`crate::native::DecodedBlock`] does not materialise.
+    /// Turning it off yields the path-based JSON serialisation, rebuilt into
+    /// nested documents printed as the server prints them. A column it cannot
+    /// print that way (typed paths, dates, arrays of objects, values past
+    /// `max_dynamic_paths` or `max_dynamic_types`) fails the query with
+    /// [`crate::Error::Unsupported`] naming the column.
+    /// `docs/type-support.md` lists each case.
     #[must_use]
     pub fn with_json_as_string(mut self, on: bool) -> Self {
         self.json_as_string = on;
@@ -482,6 +497,30 @@ mod tests {
         match &trust.tls {
             Some(TlsConfigSource::Trust(t)) => assert!(t.exclusive),
             other => panic!("with_tls_trust must store a Trust source, got {other:?}"),
+        }
+    }
+
+    /// `(addr, server_name, name every endpoint is held to)`: the address's own
+    /// host is the per-endpoint default, and any other name is an override.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn new_tls_keeps_only_a_name_that_differs_from_the_host() {
+        use crate::tcp::pool::ConnectKindConfig;
+
+        for (addr, name, held) in [
+            ("ch-1.example:9440", "ch-1.example", None),
+            ("CH-1.example:9440", "ch-1.example", None),
+            ("[::1]:9440", "::1", None),
+            ("10.0.0.5:9440", "ch.example", Some("ch.example")),
+            ("ch-1.example:9440", "ch.example", Some("ch.example")),
+        ] {
+            let client = TcpClient::new_tls(addr, name);
+            match &client.config.kind {
+                ConnectKindConfig::Tls { server_name } => {
+                    assert_eq!(server_name.as_deref(), held, "{addr} as {name}");
+                }
+                ConnectKindConfig::Plain => panic!("new_tls must select TLS"),
+            }
         }
     }
 

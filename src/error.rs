@@ -91,6 +91,8 @@ pub enum Error {
     InvalidColumnsHeader(#[source] BoxedError),
     #[error("schema mismatch: {0}")]
     SchemaMismatch(String),
+    /// A well-formed value this crate cannot decode or print as the server
+    /// does. The same query fails the same way, so it is not retriable.
     #[error("unsupported: {0}")]
     Unsupported(String),
     /// A dynamic-insert failure, kept typed so a caller can tell a stale

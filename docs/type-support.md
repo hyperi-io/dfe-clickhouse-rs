@@ -36,14 +36,23 @@ text. `Object('json')` is the deprecated type and reads as a plain String.
 
 A `JSON` column travels as `String` in both directions: an insert declares it
 `String` and the server converts, and every query asks for
-`output_format_native_write_json_as_string=1` so it comes back as text.
+`output_format_native_write_json_as_string=1` so it comes back as text. That
+holds at any depth, so `Nullable(JSON)`, `Array(JSON)` and `Map(K, JSON)`
+insert too.
 
-Turning that setting off also works, and has since the advertised revision
-reached 54473: the server then sends the V2 path-based serialisation, which the
-decoder reads. The setting stays the default because the text form costs the
-server nothing to produce, not because it is the only readable one. Both
-directions are covered in `tests/wire_docker.rs` by
-`json_reads_with_or_without_the_string_flag`.
+`JSON(max_dynamic_paths=N, max_dynamic_types=N, SKIP path, SKIP REGEXP 're')`
+and typed paths such as ``JSON(`a.b` UInt32)`` read and insert like plain
+`JSON`, because text goes in and comes out the same.
+
+A `Variant` or `Dynamic` value prints as the server's `toJSONString` prints
+it, for `Bool`, integers up to 64 bits, `Float32`, `Float64`, `String` and
+arrays of them. Any other type (a date or time, a decimal, a UUID), and a
+`Dynamic` value stored past `max_types` (`SharedVariant`), fails the query with
+`Error::Unsupported` naming the column, over native TCP and over HTTP through
+`UnifiedClient`. The error says to read the column cast to String in the query,
+as `CAST(d AS String)`. A nested `Dynamic` in the flattened serialisation is
+refused too. `dynamic_and_variant_values_print_like_the_server_or_refuse`
+pins each.
 
 Two limits worth knowing before sending data:
 
@@ -53,6 +62,33 @@ Two limits worth knowing before sending data:
 - An integer too wide for any ClickHouse integer type is stored as a `Float64`
   and silently rounded -- about 17 significant digits survive, with no error.
   Send such fields as strings.
+
+## Path-based JSON reads
+
+`with_json_as_string(false)` turns `output_format_native_write_json_as_string`
+off, and the server sends a path-based serialisation instead (V2, or flattened
+when asked). The decoder rebuilds each document byte for byte as the server
+prints it: `a.b` as `{"a":{"b":...}}`, siblings in full-path order, `Bool` as
+`true` or `false`, a float in plain decimal for exponents -6 to 20 and as
+`1e21` outside them, strings with the server's escapes (`\/`, `\u2028`).
+`path_based_json_reads_byte_for_byte_like_the_server` pins each value type on
+both serialisations.
+
+Where it would print something the server would not, the read fails with
+`Error::Unsupported` naming the column and pointing at
+`with_json_as_string(true)`, the default, which reads all of these whole:
+
+- Typed paths, whose sub-columns it does not decode.
+- A date or time, which the server infers from a string and prints in its time
+  zone.
+- An array of objects, `Array(JSON)` inside a path, whose serialisation prefix
+  it does not walk.
+- A value at a path and at a path under it in one row (`a` and `a.b`), which
+  the server prints as a duplicate key.
+- A key holding a dot, escaped as `%2E` in the path.
+- A path past `max_dynamic_paths` (shared data) or a type past
+  `max_dynamic_types` (`SharedVariant`), stored in a binary encoding it does
+  not read (`spilled_values_are_refused_never_dropped`).
 
 ## Sparse columns
 
@@ -75,3 +111,7 @@ Sparse are decoded; the rest are refused by name.
 
 `AggregateFunction`, `Nested` (decomposes as `Array(Tuple)`), `Ring`,
 `Polygon`, `MultiPolygon`.
+
+A runtime-schema insert also refuses `Tuple`, `Variant` and `Dynamic`. It
+takes a `Point` as an `[x, y]` pair or a `{"lat", "lon"}` object, with
+longitude as x.

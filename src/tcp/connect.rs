@@ -136,9 +136,10 @@ pub enum ConnectKind {
     /// TLS over TCP.
     #[cfg(feature = "tls")]
     Tls {
-        /// SNI sent in the ClientHello and the name the server
-        /// certificate is validated against.
-        server_name: String,
+        /// SNI sent in the ClientHello and the name the server certificate
+        /// is validated against. `None` is the host of the endpoint being
+        /// connected, which the pool fills in per endpoint.
+        server_name: Option<String>,
         /// Resolved rustls trust the pool built once and shares (cloned
         /// `Arc`) across reconnects.
         config: std::sync::Arc<tokio_rustls::rustls::ClientConfig>,
@@ -148,6 +149,43 @@ pub enum ConnectKind {
     /// broaden trust), but every connection attempt fails closed here.
     #[cfg(feature = "tls")]
     TlsFailClosed,
+}
+
+impl ConnectKind {
+    /// This kind for one `host:port` endpoint: an unset TLS name becomes that
+    /// endpoint's host, and anything else is returned as it is.
+    #[cfg_attr(not(feature = "tls"), allow(clippy::unused_self, unused_variables))]
+    pub(crate) fn for_endpoint(&self, endpoint: &str) -> std::borrow::Cow<'_, Self> {
+        use std::borrow::Cow;
+
+        match self {
+            #[cfg(feature = "tls")]
+            Self::Tls {
+                server_name: None,
+                config,
+            } => Cow::Owned(Self::Tls {
+                server_name: Some(endpoint_host(endpoint).to_owned()),
+                config: std::sync::Arc::clone(config),
+            }),
+            #[cfg(feature = "tls")]
+            Self::Tls {
+                server_name: Some(_),
+                ..
+            }
+            | Self::TlsFailClosed => Cow::Borrowed(self),
+            Self::Plain => Cow::Borrowed(self),
+        }
+    }
+}
+
+/// The host of a `host:port` endpoint, with an IPv6 literal's brackets
+/// dropped: the name a certificate for that endpoint is issued to.
+#[cfg(feature = "tls")]
+pub(crate) fn endpoint_host(endpoint: &str) -> &str {
+    let host = endpoint.rsplit_once(':').map_or(endpoint, |(host, _)| host);
+    host.strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
 }
 
 /// Connect to `addr` and drive the handshake to completion. Returns
@@ -168,11 +206,16 @@ pub async fn open_handshaken(
 ) -> Result<(MaybeTlsStream, ServerHello)> {
     let mut stream = match kind {
         ConnectKind::Plain => connect_plain(addr).await?,
+        // An unset name is the address dialled, for a kind built by hand
+        // rather than by the pool.
         #[cfg(feature = "tls")]
         ConnectKind::Tls {
             server_name,
             config,
-        } => connect_tls(addr, server_name, config.clone()).await?,
+        } => {
+            let name = server_name.clone().unwrap_or_else(|| addr.ip().to_string());
+            connect_tls(addr, &name, config.clone()).await?
+        }
         #[cfg(feature = "tls")]
         ConnectKind::TlsFailClosed => {
             return Err(Error::Custom(
@@ -190,6 +233,59 @@ pub async fn open_handshaken(
 mod tests {
     use super::*;
     use tokio::net::TcpListener;
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn endpoint_host_is_the_name_before_the_port() {
+        for (endpoint, host) in [
+            ("ch-1.example:9440", "ch-1.example"),
+            ("10.0.0.5:9440", "10.0.0.5"),
+            ("[::1]:9440", "::1"),
+            ("localhost", "localhost"),
+        ] {
+            assert_eq!(endpoint_host(endpoint), host, "{endpoint}");
+        }
+    }
+
+    /// An unset name takes each endpoint's own host, and an explicit one is
+    /// kept for every endpoint.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn for_endpoint_fills_only_an_unset_tls_name() {
+        let config = crate::tls::build_client_config(&crate::tls::TlsConfigSource::Trust(
+            crate::tls::TlsTrust::default(),
+        ))
+        .expect("the default trust resolves");
+        let name_for =
+            |kind: &ConnectKind, endpoint: &str| match kind.for_endpoint(endpoint).as_ref() {
+                ConnectKind::Tls { server_name, .. } => server_name.clone(),
+                other => panic!("a TLS kind stays TLS, got {other:?}"),
+            };
+
+        let derived = ConnectKind::Tls {
+            server_name: None,
+            config: std::sync::Arc::clone(&config),
+        };
+        assert_eq!(
+            name_for(&derived, "ch-2.example:9440").as_deref(),
+            Some("ch-2.example")
+        );
+        assert_eq!(name_for(&derived, "[::1]:9440").as_deref(), Some("::1"));
+
+        let explicit = ConnectKind::Tls {
+            server_name: Some("ch.example".to_string()),
+            config,
+        };
+        assert_eq!(
+            name_for(&explicit, "10.0.0.5:9440").as_deref(),
+            Some("ch.example")
+        );
+
+        assert!(matches!(
+            ConnectKind::Plain.for_endpoint("h:9000"),
+            std::borrow::Cow::Borrowed(ConnectKind::Plain)
+        ));
+    }
 
     /// Nagle would batch small protocol packets behind a 40ms delayed
     /// ACK, and without keepalive a kube-proxy conntrack entry drops an

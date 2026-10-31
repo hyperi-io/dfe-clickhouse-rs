@@ -850,11 +850,14 @@ pub(crate) async fn decode_block<R: ClickHouseRead>(
                     let positions =
                         crate::native::sparse::read_sparse_offsets(r, rows, &mut state).await?;
                     let present = u64::try_from(positions.len()).unwrap_or(u64::MAX);
-                    let dense =
-                        decode_column(r, &ct, present, server_revision, 0, &mut headers).await?;
+                    let dense = decode_column(r, &ct, present, server_revision, 0, &mut headers)
+                        .await
+                        .map_err(|e| name_the_column(&name, e))?;
                     dense.expand_sparse(&positions, rows)?
                 } else {
-                    decode_column(r, &ct, num_rows, server_revision, 0, &mut headers).await?
+                    decode_column(r, &ct, num_rows, server_revision, 0, &mut headers)
+                        .await
+                        .map_err(|e| name_the_column(&name, e))?
                 }
             }
             None => {
@@ -875,6 +878,14 @@ pub(crate) async fn decode_block<R: ClickHouseRead>(
         schema,
         num_rows,
     })
+}
+
+/// An [`Error::Unsupported`] from a column's values, with the column named.
+fn name_the_column(name: &str, e: Error) -> Error {
+    match e {
+        Error::Unsupported(m) => Error::Unsupported(format!("column '{name}': {m}")),
+        other => other,
+    }
 }
 
 /// Consume the serialisation prefixes for `col_type`'s whole tree, in the
@@ -940,6 +951,19 @@ fn decode_prefixes<'a, R: ClickHouseRead + 'a>(
                 let has_max_types = match version {
                     1 => true,
                     2 => false,
+                    // Only at the top level, where nothing sits between this
+                    // prefix and the column's own data.
+                    3 if depth == 0 => {
+                        headers.push(columns::DynamicHeader::flattened());
+                        return Ok(());
+                    }
+                    3 => {
+                        return Err(Error::Unsupported(
+                            "a nested Dynamic in the flattened serialisation is not read. \
+                             Leave output_format_native_use_flattened_dynamic_and_json_serialization off"
+                                .to_owned(),
+                        ));
+                    }
                     other => {
                         return Err(Error::BadResponse(format!(
                             "native: unsupported Dynamic serialization version: {other}"
@@ -957,7 +981,7 @@ fn decode_prefixes<'a, R: ClickHouseRead + 'a>(
 /// The zero-row shape of `col_type`, for a block that carries no column bytes.
 fn empty_column(col_type: &ColumnType) -> DecodedColumn {
     match col_type {
-        ColumnType::UInt8 => DecodedColumn::UInt8(Vec::new()),
+        ColumnType::UInt8 | ColumnType::Bool => DecodedColumn::UInt8(Vec::new()),
         ColumnType::Int8 | ColumnType::Enum8 => DecodedColumn::Int8(Vec::new()),
         ColumnType::UInt16 => DecodedColumn::UInt16(Vec::new()),
         ColumnType::Int16 | ColumnType::Enum16 => DecodedColumn::Int16(Vec::new()),
@@ -992,9 +1016,11 @@ fn empty_column(col_type: &ColumnType) -> DecodedColumn {
             values: Vec::new(),
         },
         ColumnType::String => DecodedColumn::String(Vec::new()),
-        ColumnType::Json | ColumnType::NewJson | ColumnType::Variant(_) | ColumnType::Dynamic => {
-            DecodedColumn::Json(Vec::new())
-        }
+        ColumnType::Json
+        | ColumnType::NewJson
+        | ColumnType::TypedJson
+        | ColumnType::Variant(_)
+        | ColumnType::Dynamic => DecodedColumn::Json(Vec::new()),
         ColumnType::FixedString(width) => DecodedColumn::FixedString {
             width: *width,
             bytes: Vec::new(),
@@ -1101,7 +1127,8 @@ fn decode_column<'a, R: ClickHouseRead + 'a>(
         })?;
 
         match col_type {
-            ColumnType::UInt8 => {
+            // Bool decodes as its wire byte, which `get::<bool>` reads.
+            ColumnType::UInt8 | ColumnType::Bool => {
                 let buf = read_exact_grown(r, n).await?;
                 Ok(DecodedColumn::UInt8(buf))
             }
@@ -1297,7 +1324,7 @@ fn decode_column<'a, R: ClickHouseRead + 'a>(
                 // Wire-compatible with the inner type T.
                 decode_column(r, inner, num_rows, server_revision, depth + 1, headers).await
             }
-            ColumnType::NewJson => {
+            ColumnType::NewJson | ColumnType::TypedJson => {
                 let version = r.read_u64_le().await?;
                 if version == columns::JSON_SERIALIZATION_STRING {
                     let mut buf = with_cap(n)?;
@@ -1305,6 +1332,9 @@ fn decode_column<'a, R: ClickHouseRead + 'a>(
                         buf.push(r.read_string().await?);
                     }
                     return Ok(DecodedColumn::Json(buf));
+                }
+                if matches!(col_type, ColumnType::TypedJson) {
+                    return Err(columns::typed_json_unsupported());
                 }
                 // The path-based serialisations reassemble into one JSON
                 // document per row, length-prefixed as RowBinary strings.
