@@ -16,6 +16,9 @@ description = "HyperI extensions for the official ClickHouse Rust client: TCP tr
 authors = ["HYPERI PTY LIMITED <dev@hyperi.io>"]
 license = "Apache-2.0"
 repository = "https://github.com/hyperi-io/dfe-clickhouse-rs"
+documentation = "https://docs.rs/dfe-clickhouse"
+# The crates.io page. README.md stays the GitHub front page and the docs.rs crate docs.
+readme = "docs/crate.md"
 publish = true
 keywords = ["clickhouse", "database", "tcp", "tokio"]
 categories = ["database", "asynchronous"]
