@@ -2062,7 +2062,8 @@ async fn write_n_d(
 }
 
 /// A defaulted column takes the row's value where the row carries one and the
-/// server's default where it does not, whichever shape the first row has.
+/// server's default where it does not, whichever shape the first row has. Over
+/// HTTP the whole batch is still one INSERT.
 #[tokio::test]
 async fn a_defaulted_column_is_kept_or_defaulted_row_by_row() {
     const ORDERS: [&[Option<&str>]; 2] = [
@@ -2100,6 +2101,22 @@ async fn a_defaulted_column_is_kept_or_defaulted_row_by_row() {
             if !got.as_ref().is_ok_and(|got| *got == want) {
                 failures.push(format!("{name} {rows:?} read {got:?}, wanted {want:?}"));
             }
+        }
+    }
+
+    tcp.execute("SYSTEM FLUSH LOGS").await.unwrap();
+    for i in 0..ORDERS.len() {
+        let inserts = tcp
+            .fetch_columns(&format!(
+                "SELECT count() AS c FROM system.query_log WHERE type = 'QueryFinish' \
+                 AND query LIKE 'INSERT INTO `wire`.`defaults_http_{i}`%'"
+            ))
+            .await
+            .and_then(|c| c.get::<u64>("c"));
+        if !inserts.as_ref().is_ok_and(|c| *c == [1]) {
+            failures.push(format!(
+                "http order {i}: INSERT count {inserts:?}, wanted 1"
+            ));
         }
     }
 

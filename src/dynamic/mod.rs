@@ -12,10 +12,10 @@
 //! encoder over `serde_json::Map<String, Value>` rows, so a caller with no
 //! compile-time row struct still puts binary on the wire instead of JSONEachRow.
 //!
-//! [`DynamicInsert`] ships those rows over HTTP (`FORMAT RowBinary` through
-//! `clickhouse::Client`) or, with the `tcp` feature, over the native protocol
-//! (`FORMAT Native` through `TcpClient`). Both sinks are fed the same
-//! [`DynamicRow::encode_into`] bytes.
+//! [`DynamicInsert`] ships those rows over HTTP (`FORMAT RowBinaryWithDefaults`
+//! through `clickhouse::Client`) or, with the `tcp` feature, over the native
+//! protocol (`FORMAT Native` through `TcpClient`). Both sinks share the
+//! per-column encoder behind [`DynamicRow::encode_into`].
 //!
 //! The five modules below were ported from the DFE Loader and relicensed
 //! Apache-2.0 to match the crate.

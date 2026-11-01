@@ -76,7 +76,7 @@ codec rather than upstream's reader. So a `JSON` column reads identically over
 either transport, and `Variant` and `Dynamic` take the same route -- one document
 of text per row.
 
-Inserts are binary on both sides for the same reason: RowBinary over HTTP, Native
+Inserts are binary on both sides for the same reason: RowBinaryWithDefaults over HTTP, Native
 columnar over TCP, sharing the encoder. There is no JSONEachRow path anywhere,
 and over native TCP the choice does not exist at all, because the protocol
 accepts Native and nothing else.

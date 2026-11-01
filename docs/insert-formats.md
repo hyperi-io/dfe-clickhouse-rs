@@ -20,7 +20,7 @@ two.
 
 | Path | Format | Transport |
 |---|---|---|
-| `UnifiedClient::dynamic_insert` -> HTTP | RowBinary | HTTP |
+| `UnifiedClient::dynamic_insert` -> HTTP | RowBinaryWithDefaults | HTTP |
 | `UnifiedClient::dynamic_insert` -> TCP | Native, columnar | native TCP |
 | `TcpClient::insert_native` | Native, columnar | native TCP |
 | `clickhouse::Client::insert::<T>` | RowBinary | HTTP (upstream, unchanged) |
@@ -33,7 +33,7 @@ same either way, and the server stops parsing text.
 Over native TCP the choice does not exist at all: the protocol accepts Native
 format and nothing else, which is a server constraint rather than a gap here.
 
-An INSERT names its columns once. `DynamicInsert` names every required column and every defaulted column the row supplies, and leaves the server to fill the defaulted ones it omits. A later row that supplies a different set of defaulted columns commits the rows so far and opens a new INSERT, so the row's values land and the server's defaults stay the server's. A batch whose rows vary that way becomes several INSERTs, and an error late in it can follow rows already committed. Retry the whole batch.
+Over HTTP the INSERT names every column the server takes a value for, and each row flags the defaulted columns it omits, so the server fills those and a batch stays one INSERT. Native has no per-row default. A TCP INSERT names the required columns and the defaulted ones its first row supplies, and a later row that supplies a different set commits the rows so far and opens a new INSERT. A TCP batch whose rows vary that way becomes several INSERTs, and an error late in it can follow rows already committed. Retry the whole batch.
 
 Both transports send once 1 MiB of rows is buffered, so a batch never sits whole in memory.
 

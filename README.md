@@ -80,7 +80,7 @@ cargo add dfe-clickhouse --features dynamic
 ```
 
 Rows arrive as `serde_json::Map`, column types come from `system.columns`.
-Binary on the wire either way -- `FORMAT RowBinary` over HTTP, `FORMAT Native`
+Binary on the wire either way -- `FORMAT RowBinaryWithDefaults` over HTTP, `FORMAT Native`
 over TCP -- so the server does no JSON parsing.
 
 ## Features

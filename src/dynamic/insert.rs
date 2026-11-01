@@ -12,14 +12,15 @@
 //! Single-table dynamic insert with schema-mismatch recovery.
 //!
 //! [`DynamicInsert`] encodes each `Map<String, Value>` against a
-//! [`DynamicSchema`] and ships the rows through one of two sinks, both fed the
-//! same [`DynamicRow::encode_into`] bytes:
+//! [`DynamicSchema`] and ships the rows through one of two sinks:
 //!
-//! - HTTP -- `Client::insert_formatted_with(... FORMAT RowBinary)`, written
-//!   row-wise. The schema is read from `system.columns` on the first write and
-//!   cached.
+//! - HTTP -- `Client::insert_formatted_with(... FORMAT RowBinaryWithDefaults)`,
+//!   naming every insertable column, written row-wise. A row that omits a
+//!   defaulted column flags it, and the server fills its default, so a batch is
+//!   one INSERT whatever its rows carry. The schema is read from
+//!   `system.columns` on the first write and cached.
 //! - TCP (`tcp` feature) -- `TcpClient::insert_native(... FORMAT Native)`, with
-//!   the rows transposed into columnar blocks by
+//!   [`DynamicRow::encode_into`] rows transposed into columnar blocks by
 //!   [`crate::native::encode_columns`]. The schema is supplied by the caller,
 //!   which [`crate::unified::UnifiedClient::dynamic_insert`] reads over the
 //!   same TCP connection before opening the insert.
@@ -27,11 +28,11 @@
 //! Both sinks send once 1 MiB is buffered, so memory holds one chunk of the
 //! batch, never the whole of it.
 //!
-//! An INSERT names its columns once, and a defaulted column it leaves out is
-//! filled by the server. A row that supplies a different set of defaulted
-//! columns than the open INSERT names therefore commits the rows so far and
-//! opens a new INSERT for itself, so no supplied value is dropped and no omitted
-//! one gets the type's zero in place of the server's default.
+//! Native has no per-row default, so a TCP INSERT names only the defaulted
+//! columns its first row supplies. A row that supplies a different set commits
+//! the rows so far and opens a new INSERT for itself, so no supplied value is
+//! dropped and no omitted one gets the type's zero in place of the server's
+//! default.
 //!
 //! On a schema-mismatch error the HTTP path invalidates the cached schema so
 //! the next insert re-fetches.
@@ -84,16 +85,18 @@ enum Backend {
     Tcp(TcpClient),
 }
 
-/// The sink opened for one column subset.
+/// The sink carrying one INSERT.
 enum OpenSink {
     Http {
         insert: InsertFormatted,
-        /// RowBinary rows held for the next chunk.
+        /// `RowBinaryWithDefaults` rows held for the next chunk.
         chunk: Vec<u8>,
     },
     #[cfg(feature = "tcp")]
     Tcp {
         session: TcpInsertSession,
+        /// [`default_shape`] of the row that opened it.
+        shape: Vec<bool>,
         /// Native block headers for the insert columns, parsed once.
         native: Vec<ColumnSchema>,
         /// RowBinary rows held for the next Native block.
@@ -147,12 +150,9 @@ impl RowBlock {
     }
 }
 
-/// The open INSERT: the column subset its first row fixed, and the sink
-/// carrying it.
+/// The open INSERT: the columns it names, and the sink carrying it.
 struct Active {
     columns: Vec<ColumnDef>,
-    /// [`default_shape`] of the row that opened it.
-    shape: Vec<bool>,
     sink: OpenSink,
 }
 
@@ -162,10 +162,11 @@ struct Active {
 /// schema fetched from `system.columns`. As simple to drive as JSONEachRow,
 /// but binary on the wire so the server skips JSON parsing.
 ///
-/// Rows that supply different sets of defaulted columns go out as separate
-/// INSERTs, each committed when the next set arrives and the last by
-/// [`end`][Self::end]. An error can therefore follow rows already committed:
-/// retry the whole batch, which at-least-once delivery tolerates.
+/// Over HTTP a batch is one INSERT. Over TCP, rows that supply different sets
+/// of defaulted columns go out as separate INSERTs, each committed when the
+/// next set arrives and the last by [`end`][Self::end]. An error can therefore
+/// follow rows already committed: retry the whole batch, which at-least-once
+/// delivery tolerates.
 #[must_use = "a DynamicInsert must be finished with `.end().await` to commit the rows"]
 #[non_exhaustive]
 pub struct DynamicInsert {
@@ -241,7 +242,8 @@ impl DynamicInsert {
         Ok(())
     }
 
-    /// With no INSERT open, fix the column subset from `row` and open the sink.
+    /// With no INSERT open, choose its columns and open the sink: every
+    /// insertable column over HTTP, the subset `row` fixes over TCP.
     ///
     /// `raw_names` are column names supplied via raw passthrough (e.g. `_json`)
     /// that must be in the INSERT even if absent from the row map.
@@ -249,7 +251,11 @@ impl DynamicInsert {
     // synchronously. Callers await this either way, so the signature is fixed.
     #[cfg_attr(
         not(feature = "tcp"),
-        allow(clippy::unused_async, clippy::unused_async_trait_impl)
+        allow(
+            clippy::unused_async,
+            clippy::unused_async_trait_impl,
+            unused_variables
+        )
     )]
     async fn ensure_active(
         &mut self,
@@ -267,8 +273,11 @@ impl DynamicInsert {
                 message: "schema not available after fetch".to_string(),
             })?;
 
-        let columns = select_columns(row, raw_names, schema);
-        let shape: Vec<bool> = default_shape(row, raw_names, schema).collect();
+        let columns = match &self.backend {
+            Backend::Http { .. } => insertable_columns(schema),
+            #[cfg(feature = "tcp")]
+            Backend::Tcp(_) => select_columns(row, raw_names, schema),
+        };
         if columns.is_empty() {
             return Err(DynamicError::EncodingError {
                 column: String::new(),
@@ -290,7 +299,7 @@ impl DynamicInsert {
 
         let sink = match &self.backend {
             Backend::Http { client, .. } => {
-                let sql = format!("INSERT INTO {target} ({cols_sql}) FORMAT RowBinary");
+                let sql = format!("INSERT INTO {target} ({cols_sql}) FORMAT RowBinaryWithDefaults");
                 let mut client = client.clone();
                 if json_columns {
                     client = client.with_setting(JSON_AS_STRING_SETTING, "1");
@@ -317,17 +326,14 @@ impl DynamicInsert {
                     .map_err(|e| classify_error(&full, e))?;
                 OpenSink::Tcp {
                     session,
+                    shape: default_shape(row, raw_names, schema).collect(),
                     native,
                     block: RowBlock::default(),
                 }
             }
         };
 
-        self.active = Some(Active {
-            columns,
-            shape,
-            sink,
-        });
+        self.active = Some(Active { columns, sink });
         Ok(())
     }
 
@@ -375,15 +381,19 @@ impl DynamicInsert {
         passthrough: Option<(&str, &[u8])>,
     ) -> Result<(), DynamicError> {
         self.ensure_schema().await?;
-        let reshaped = match (&self.active, &self.schema) {
-            (Some(active), Some(schema)) => !active
-                .shape
+        #[cfg(feature = "tcp")]
+        if let (
+            Some(Active {
+                sink: OpenSink::Tcp { shape, .. },
+                ..
+            }),
+            Some(schema),
+        ) = (&self.active, &self.schema)
+            && !shape
                 .iter()
                 .copied()
-                .eq(default_shape(row, raw_names, schema)),
-            _ => false,
-        };
-        if reshaped {
+                .eq(default_shape(row, raw_names, schema))
+        {
             self.commit().await?;
         }
         self.ensure_active(row, raw_names).await?;
@@ -409,7 +419,7 @@ impl DynamicInsert {
         match sink {
             OpenSink::Http { insert, chunk } => {
                 let start = chunk.len();
-                if let Err(e) = dynamic_row.encode_into(chunk) {
+                if let Err(e) = dynamic_row.encode_with_defaults_into(chunk) {
                     chunk.truncate(start);
                     return Err(e);
                 }
@@ -422,6 +432,7 @@ impl DynamicInsert {
                 session,
                 native,
                 block,
+                ..
             } => {
                 block.push(&dynamic_row)?;
                 if block.is_full(TcpClient::DEFAULT_INSERT_BLOCK_ROWS) {
@@ -466,6 +477,7 @@ impl DynamicInsert {
                 session,
                 native,
                 mut block,
+                ..
             } => match send_block(&session, &native, &mut block, &full).await {
                 Ok(()) => session.finish().await.map_err(|e| classify_error(&full, e)),
                 Err(e) => {
@@ -554,10 +566,22 @@ async fn send_block(
         .map_err(|e| classify_error(full_table, e))
 }
 
-/// Choose the columns to include in the INSERT: every column present in the
+/// Every column an INSERT may name. The server computes `MATERIALIZED` and
+/// `ALIAS` columns itself and refuses a value for either.
+fn insertable_columns(schema: &DynamicSchema) -> Vec<ColumnDef> {
+    schema
+        .columns
+        .iter()
+        .filter(|c| !matches!(c.default_kind.as_str(), "MATERIALIZED" | "ALIAS"))
+        .cloned()
+        .collect()
+}
+
+/// Choose the columns to include in a TCP INSERT: every column present in the
 /// row, every raw-passthrough column, and every required column (no
 /// server-side default). Columns that have a default and are not supplied are
 /// omitted so the server fills them (e.g. `_uuid`, `_timestamp_load`).
+#[cfg(feature = "tcp")]
 fn select_columns(
     row: &Map<String, Value>,
     raw_names: &[&str],
@@ -572,7 +596,8 @@ fn select_columns(
 }
 
 /// For each defaulted column of the schema, in order, whether `row` supplies
-/// it. Rows with equal shapes share an INSERT's column list.
+/// it. Rows with equal shapes share a TCP INSERT's column list.
+#[cfg(feature = "tcp")]
 fn default_shape<'a>(
     row: &'a Map<String, Value>,
     raw_names: &'a [&str],
@@ -586,6 +611,7 @@ fn default_shape<'a>(
 }
 
 /// Whether the row map or a raw passthrough carries `column`.
+#[cfg(feature = "tcp")]
 fn supplies(row: &Map<String, Value>, raw_names: &[&str], column: &ColumnDef) -> bool {
     row.contains_key(&column.name) || raw_names.contains(&column.name.as_str())
 }
@@ -676,6 +702,7 @@ fn classify_error(full_table: &str, e: impl Into<crate::Error>) -> DynamicError 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "tcp")]
     use serde_json::json;
 
     fn schema() -> DynamicSchema {
@@ -690,6 +717,22 @@ mod tests {
         )
     }
 
+    /// HTTP names every column the server will take a value for, so one INSERT
+    /// carries any row, and leaves out the ones it computes itself.
+    #[test]
+    fn insertable_columns_skip_only_computed_columns() {
+        let mut s = schema();
+        s.columns
+            .push(ColumnDef::with_default_kind("m", "UInt8", "MATERIALIZED"));
+        s.columns
+            .push(ColumnDef::with_default_kind("a", "UInt8", "ALIAS"));
+        s.columns
+            .push(ColumnDef::with_default_kind("e", "UInt8", "EPHEMERAL"));
+        let names: Vec<String> = insertable_columns(&s).into_iter().map(|c| c.name).collect();
+        assert_eq!(names, ["id", "name", "_uuid", "_json", "e"]);
+    }
+
+    #[cfg(feature = "tcp")]
     #[test]
     fn select_columns_includes_present_and_required_omits_absent_default() {
         let s = schema();
@@ -701,6 +744,7 @@ mod tests {
         assert_eq!(names, vec!["id", "name", "_json"]);
     }
 
+    #[cfg(feature = "tcp")]
     #[test]
     fn select_columns_includes_raw_passthrough_column() {
         let s = schema();
