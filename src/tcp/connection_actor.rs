@@ -439,8 +439,10 @@ impl ConnectionHandle {
     ///
     /// # Errors
     ///
-    /// As [`Self::execute_stream`]: the query is issued before the cursor
-    /// is returned. Errors after that reach the caller via
+    /// [`Error::Custom`] if the actor has exited, or whatever kept the
+    /// query off the wire (a write failure or timeout, a poisoned
+    /// connection, an INSERT in progress): the query is issued before the
+    /// cursor is returned. Errors after that reach the caller via
     /// `TcpRawCursor::next_block()`.
     pub async fn execute_stream_cursor(
         &self,
