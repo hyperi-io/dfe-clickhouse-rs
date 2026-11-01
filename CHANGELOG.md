@@ -3,6 +3,12 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [0.1.6](https://github.com/hyperi-io/dfe-clickhouse-rs/compare/v0.1.5...v0.1.6) (2026-11-01)
+
+### Bug Fixes
+
+* manual remediation of LLM auto fixes -- parse parameterised JSON columns ([#35](https://github.com/hyperi-io/dfe-clickhouse-rs/issues/35)) ([c8c3f2b](https://github.com/hyperi-io/dfe-clickhouse-rs/commit/c8c3f2b83a0552b2d99aed702f945e76bcc9fe01))
+
 ## [0.1.5](https://github.com/hyperi-io/dfe-clickhouse-rs/compare/v0.1.4...v0.1.5) (2026-10-31)
 
 ### Bug Fixes
