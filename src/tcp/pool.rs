@@ -130,7 +130,8 @@ impl TcpConnectionManager {
 
     /// Connect to the first of `addrs` that completes a handshake, so a name
     /// whose first record is unreachable (`localhost` as `::1` against an
-    /// IPv4-only server) or silent still connects.
+    /// IPv4-only server) or silent still connects. When none does, the error
+    /// is the one from the address that got furthest (see [`Reach`]).
     async fn connect_first(
         &self,
         endpoint: &str,
@@ -140,7 +141,7 @@ impl TcpConnectionManager {
     ) -> Result<ConnectionHandle> {
         let addrs: Vec<std::net::SocketAddr> = addrs.into_iter().collect();
         let began = tokio::time::Instant::now();
-        let mut last_err = None;
+        let mut best_err = None;
         for (i, &addr) in addrs.iter().enumerate() {
             let remaining = budget.map(|b| b.saturating_sub(began.elapsed()));
             if remaining.is_some_and(|r| r.is_zero()) {
@@ -168,10 +169,10 @@ impl TcpConnectionManager {
                         },
                     ));
                 }
-                Err(e) => last_err = Some(e),
+                Err(e) => keep_most_informative(&mut best_err, e),
             }
         }
-        Err(last_err.unwrap_or_else(|| {
+        Err(best_err.unwrap_or_else(|| {
             Error::Connect(format!("tcp: {endpoint:?} resolved to no addresses"))
         }))
     }
@@ -187,6 +188,49 @@ const MIN_ENDPOINT_SLICE: Duration = Duration::from_secs(1);
 fn endpoint_slice(remaining: Duration, attempts_left: usize) -> Duration {
     let share = remaining / u32::try_from(attempts_left.max(1)).unwrap_or(u32::MAX);
     share.max(MIN_ENDPOINT_SLICE).min(remaining)
+}
+
+/// How far a failed connect got, ordered so the most informative failure of
+/// several is the one reported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Reach {
+    /// Nothing answered: unreachable, no route, or out of time.
+    Nothing,
+    /// The host answered with a refusal, so nothing listens there.
+    Refused,
+    /// Something listened and failed the TLS, the handshake or the server.
+    Answered,
+}
+
+fn reach(e: &Error) -> Reach {
+    use std::io::ErrorKind;
+
+    match e {
+        Error::Connect(_) | Error::TimedOut => Reach::Nothing,
+        Error::Other(source) => match source
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind)
+        {
+            Some(ErrorKind::ConnectionRefused) => Reach::Refused,
+            Some(
+                ErrorKind::NetworkUnreachable
+                | ErrorKind::HostUnreachable
+                | ErrorKind::NetworkDown
+                | ErrorKind::AddrNotAvailable
+                | ErrorKind::TimedOut,
+            ) => Reach::Nothing,
+            _ => Reach::Answered,
+        },
+        _ => Reach::Answered,
+    }
+}
+
+/// Keep `e` over `best` only when it got further, so within one reach the
+/// first address's error stands.
+fn keep_most_informative(best: &mut Option<Error>, e: Error) {
+    if best.as_ref().is_none_or(|b| reach(&e) > reach(b)) {
+        *best = Some(e);
+    }
 }
 
 /// How long one address may take, with `left` addresses still to try. With no
@@ -220,7 +264,7 @@ impl managed::Manager for TcpConnectionManager {
         }
         let start = self.next.fetch_add(1, Ordering::Relaxed) % n;
         let began = tokio::time::Instant::now();
-        let mut last_err: Option<Error> = None;
+        let mut best_err: Option<Error> = None;
         for i in 0..n {
             let endpoint = &self.endpoints[(start + i) % n];
             let outcome = match self.create_timeout {
@@ -245,13 +289,13 @@ impl managed::Manager for TcpConnectionManager {
                 Ok(handle) => return Ok(handle),
                 // Remember and try the next endpoint -- a single dead or
                 // unresolvable host must not sink the whole pass.
-                Err(e) => last_err = Some(e),
+                Err(e) => keep_most_informative(&mut best_err, e),
             }
         }
-        // Every endpoint failed this pass. Surface the last error unchanged so
-        // it stays typed for retry classification. `last_err` is only unset
-        // when the budget was spent before the first attempt.
-        Err(last_err.unwrap_or_else(|| {
+        // Every endpoint failed this pass. Surface the one that got furthest,
+        // unchanged so it stays typed for retry classification. `best_err` is
+        // only unset when the budget was spent before the first attempt.
+        Err(best_err.unwrap_or_else(|| {
             Error::Connect("tcp: create timeout spent before any endpoint was tried".to_string())
         }))
     }
@@ -1136,7 +1180,9 @@ mod tests {
     }
 
     /// Every endpoint unresolvable surfaces the resolver's error rather
-    /// than the empty-list fallback, so the message names the host.
+    /// than the empty-list fallback, so the message names the host. Both
+    /// failures rank alike, so the first endpoint tried (the cursor starts at
+    /// 0) is the one named.
     #[tokio::test]
     async fn create_surfaces_the_resolver_error_when_no_endpoint_resolves() {
         let mgr = manager_over(vec![
@@ -1148,14 +1194,14 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("no-such-host-b.invalid"),
-            "expected the last endpoint's resolver error, got: {msg}"
+            msg.contains("no-such-host-a.invalid"),
+            "expected the first endpoint's resolver error, got: {msg}"
         );
     }
 
     /// The empty-endpoint arm is unreachable through `build_pool`, which
     /// asserts a non-empty list, but `create` still has to answer rather
-    /// than panic on an `unwrap` of `last_err`.
+    /// than panic on an `unwrap` of `best_err`.
     #[tokio::test]
     async fn create_over_no_endpoints_errors_rather_than_panicking() {
         let mgr = manager_over(Vec::new());
@@ -1166,8 +1212,8 @@ mod tests {
     }
 
     /// When every endpoint refuses, a single `create` pass tries them
-    /// all and surfaces the last connect error (typed) -- it does not
-    /// hang or panic.
+    /// all and surfaces a typed connect error -- it does not hang or
+    /// panic.
     #[tokio::test]
     async fn create_surfaces_error_when_all_endpoints_refuse() {
         let mut refusing = Vec::new();
@@ -1177,8 +1223,6 @@ mod tests {
             drop(dead);
         }
         let mgr = manager_over(refusing);
-        // `ConnectionHandle` is not `Debug`, so avoid `expect_err`;
-        // match the Result directly.
         // let-else, not `expect_err`: `ConnectionHandle` is not `Debug`.
         let Err(err) = mgr.create().await else {
             panic!("all endpoints refuse; create must not connect")
@@ -1218,6 +1262,177 @@ mod tests {
         assert!(
             msg.contains("refusing to connect with default trust"),
             "expected fail-closed connect error, got: {msg}"
+        );
+    }
+
+    /// `(each address's failure in order, the one reported)`: an address that
+    /// answered beats a refusal, which beats nothing answering, and within one
+    /// reach the first address wins.
+    #[test]
+    fn the_most_informative_failure_is_kept() {
+        use std::io::{Error as Io, ErrorKind};
+
+        let fail = |tag: &str| -> Error {
+            let kind = match &tag[..tag.len() - 1] {
+                "refused" => ErrorKind::ConnectionRefused,
+                "unreachable" => ErrorKind::NetworkUnreachable,
+                "nohost" => ErrorKind::HostUnreachable,
+                "noaddr" => ErrorKind::AddrNotAvailable,
+                "slow" => return Error::Connect(format!("{tag}: did not answer")),
+                "tls" => ErrorKind::InvalidData,
+                "server" => return Error::BadResponse(tag.to_string()),
+                other => panic!("no such failure {other}"),
+            };
+            Error::from(Io::new(kind, tag.to_string()))
+        };
+        for (sequence, want) in [
+            (&["unreachable1", "refused2"][..], "refused2"),
+            (&["refused1", "unreachable2"], "refused1"),
+            (&["refused1", "refused2"], "refused1"),
+            (&["tls1", "unreachable2"], "tls1"),
+            (&["unreachable1", "tls2"], "tls2"),
+            (&["refused1", "server2", "tls3"], "server2"),
+            (&["slow1", "noaddr2", "nohost3"], "slow1"),
+            (&["noaddr1", "refused2", "slow3"], "refused2"),
+        ] {
+            let mut best = None;
+            for tag in sequence {
+                keep_most_informative(&mut best, fail(tag));
+            }
+            let got = best.expect("a failure was kept").to_string();
+            assert!(got.contains(want), "{sequence:?}: kept {got}");
+        }
+    }
+
+    /// A loopback TLS server whose certificate the returned client kind does
+    /// not trust, so every handshake fails with a certificate refusal.
+    #[cfg(feature = "tls")]
+    async fn untrusted_tls_endpoint() -> (
+        std::net::SocketAddr,
+        ConnectKind,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::Arc;
+
+        use rcgen::{CertificateParams, KeyPair};
+        use rustls::crypto::aws_lc_rs::default_provider;
+        use rustls_pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+
+        // The server's certificate is self-signed, so the client's roots,
+        // another self-signed certificate, do not reach it.
+        let server_key = KeyPair::generate().unwrap();
+        let server_cert = CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&server_key)
+            .unwrap();
+        let other_key = KeyPair::generate().unwrap();
+        let other_cert = CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&other_key)
+            .unwrap();
+
+        let server_config =
+            rustls::ServerConfig::builder_with_provider(Arc::new(default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![server_cert.der().clone()],
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key.serialize_der())),
+                )
+                .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let _ = acceptor.accept(sock).await;
+            }
+        });
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(other_cert.der().clone()).unwrap();
+        let client_config =
+            rustls::ClientConfig::builder_with_provider(Arc::new(default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+        let kind = ConnectKind::Tls {
+            server_name: Some("localhost".to_string()),
+            config: Arc::new(client_config),
+        };
+        (addr, kind, server)
+    }
+
+    #[cfg(feature = "tls")]
+    fn is_certificate_refusal(e: &Error) -> bool {
+        let msg = e.to_string();
+        msg.contains("certificate") || msg.contains("Certificate")
+    }
+
+    /// When every address fails, the one that answered names the problem: a
+    /// certificate refusal from 127.0.0.1 must not be hidden behind `::1`
+    /// being unreachable or refused.
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn the_error_from_the_address_that_answered_is_reported() {
+        let (answering, kind, server) = untrusted_tls_endpoint().await;
+
+        // A closed port on ::1: refused where IPv6 is up, unreachable where not.
+        let closed = match TcpListener::bind("[::1]:0").await {
+            Ok(held) => held.local_addr().unwrap().port(),
+            Err(_) => 9,
+        };
+        let silent: std::net::SocketAddr = format!("[::1]:{closed}").parse().unwrap();
+        let mgr = manager_over(vec!["localhost:9440".to_string()]);
+        let Err(err) = mgr
+            .connect_first(
+                "localhost:9440",
+                [answering, silent],
+                &kind,
+                Some(Duration::from_secs(4)),
+            )
+            .await
+        else {
+            panic!("no address can complete the handshake")
+        };
+        server.abort();
+        assert!(
+            is_certificate_refusal(&err),
+            "expected the TLS refusal, got: {err}"
+        );
+    }
+
+    /// The same choice one level up: whichever order the endpoints come in,
+    /// one refusing the connection and one answering with a certificate
+    /// refusal, `create` reports the certificate refusal.
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn create_reports_the_endpoint_that_answered() {
+        let (answering, kind, server) = untrusted_tls_endpoint().await;
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refusing = dead.local_addr().unwrap().to_string();
+        drop(dead);
+
+        let mut wrong = Vec::new();
+        for endpoints in [
+            vec![refusing.clone(), answering.to_string()],
+            vec![answering.to_string(), refusing.clone()],
+        ] {
+            let mut mgr = manager_over(endpoints.clone());
+            mgr.kind = kind.clone();
+            match mgr.create().await {
+                Err(err) if is_certificate_refusal(&err) => {}
+                Err(err) => wrong.push(format!("{endpoints:?}: {err}")),
+                Ok(_) => wrong.push(format!("{endpoints:?}: connected")),
+            }
+        }
+        server.abort();
+        assert!(
+            wrong.is_empty(),
+            "expected the TLS refusal: {}",
+            wrong.join("; ")
         );
     }
 }
