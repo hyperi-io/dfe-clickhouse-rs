@@ -500,6 +500,7 @@ const VALUE_COLUMNS: &[(&str, &str, &str, &str)] = &[
         "0",
     ),
     ("f64", "Float64", "-1.5", "3.25"),
+    ("bf16", "BFloat16", "1.5", "-2"),
     ("b", "Bool", "true", "false"),
     ("s", "String", "''", "concat('a', char(0), 'b')"),
     ("d", "Date", "'1970-01-01'", "'2149-06-06'"),
@@ -578,6 +579,8 @@ async fn decoded_values_match_what_the_literals_asked_for() {
     assert_eq!(got.get::<i64>("i64").unwrap(), [i64::MIN, i64::MAX]);
     assert_eq!(got.get::<i128>("i128").unwrap(), [i128::MIN, 0]);
     assert_eq!(got.get::<f64>("f64").unwrap(), [-1.5, 3.25]);
+    // BFloat16 is the top half of an f32, widened exactly.
+    assert_eq!(got.get::<f32>("bf16").unwrap(), [1.5, -2.0]);
     assert_eq!(got.get::<bool>("b").unwrap(), [true, false]);
     // A ClickHouse String is bytes, so the NUL survives and UTF-8 is not
     // assumed.

@@ -6,10 +6,10 @@
 //! value buffers the cursor can index row by row without a second transpose.
 //! `Variant`, `Dynamic` and `JSON` columns arrive as
 //! [`DecodedColumn::Json`], one document per row, rendered by
-//! [`crate::native::columns::read_column`]. `BFloat16`, `Time`, `Time64` and
-//! the geo types have no typed variant yet: their wire bytes are consumed so
-//! the stream pointer stays aligned and the column is tagged
-//! [`DecodedColumn::Unsupported`].
+//! [`crate::native::columns::read_column`]. A `Point` arrives as the
+//! `Tuple(Float64, Float64)` it is on the wire (the geo shapes as arrays of
+//! it), `BFloat16` widened to `Float32`, `Time` as `Int32` seconds and
+//! `Time64` as `Int64` ticks at the column's precision.
 //!
 //! [`NativeReader.cpp`]: https://github.com/ClickHouse/ClickHouse/blob/master/src/Formats/NativeReader.cpp
 
@@ -254,11 +254,6 @@ pub enum DecodedColumn {
         /// Flat value column indexed by `offsets`.
         values: Box<DecodedColumn>,
     },
-
-    /// Type recognised by the parser but not decoded by v1. The wire
-    /// bytes have been consumed (so the stream pointer is correct);
-    /// per-row access on this variant returns an error.
-    Unsupported(String),
 }
 
 impl DecodedColumn {
@@ -304,9 +299,6 @@ impl DecodedColumn {
             Self::LowCardinality { indices, .. } => indices.row_count(),
             Self::Tuple(fields) => fields.first().map_or(0, Self::row_count),
             Self::Map { offsets, .. } => offsets.len(),
-            // Unsupported columns surface as zero rows so callers that
-            // ignore the variant don't loop over uninitialised state.
-            Self::Unsupported(_) => 0,
         }
     }
 
@@ -444,7 +436,6 @@ impl DecodedColumn {
             Self::LowCardinality { .. } => "a LowCardinality column",
             Self::Tuple(_) => "a Tuple column",
             Self::Map { .. } => "a Map column",
-            Self::Unsupported(_) => "an unsupported column",
             _ => "this column",
         }
     }
@@ -986,14 +977,14 @@ fn empty_column(col_type: &ColumnType) -> DecodedColumn {
         ColumnType::UInt16 => DecodedColumn::UInt16(Vec::new()),
         ColumnType::Int16 | ColumnType::Enum16 => DecodedColumn::Int16(Vec::new()),
         ColumnType::UInt32 => DecodedColumn::UInt32(Vec::new()),
-        ColumnType::Int32 => DecodedColumn::Int32(Vec::new()),
+        ColumnType::Int32 | ColumnType::Time => DecodedColumn::Int32(Vec::new()),
         ColumnType::UInt64 => DecodedColumn::UInt64(Vec::new()),
-        ColumnType::Int64 => DecodedColumn::Int64(Vec::new()),
+        ColumnType::Int64 | ColumnType::Time64 => DecodedColumn::Int64(Vec::new()),
         ColumnType::Int128 => DecodedColumn::Int128(Vec::new()),
         ColumnType::UInt128 => DecodedColumn::UInt128(Vec::new()),
         ColumnType::Int256 => DecodedColumn::Int256(Vec::new()),
         ColumnType::UInt256 => DecodedColumn::UInt256(Vec::new()),
-        ColumnType::Float32 => DecodedColumn::Float32(Vec::new()),
+        ColumnType::Float32 | ColumnType::BFloat16 => DecodedColumn::Float32(Vec::new()),
         ColumnType::Float64 => DecodedColumn::Float64(Vec::new()),
         ColumnType::Decimal32 { precision, scale } => DecodedColumn::Decimal32 {
             precision: *precision,
@@ -1069,7 +1060,10 @@ fn empty_column(col_type: &ColumnType) -> DecodedColumn {
             }
         }
         ColumnType::SimpleAggregateFunction(inner) => empty_column(inner),
-        other => DecodedColumn::Unsupported(format!("{other:?}")),
+        ColumnType::Point => DecodedColumn::Tuple(vec![
+            DecodedColumn::Float64(Vec::new()),
+            DecodedColumn::Float64(Vec::new()),
+        ]),
     }
 }
 
@@ -1150,9 +1144,15 @@ fn decode_column<'a, R: ClickHouseRead + 'a>(
                 Ok(DecodedColumn::Int16(read_le_column::<_, i16>(r, n).await?))
             }
             ColumnType::UInt32 => Ok(DecodedColumn::UInt32(read_le_column::<_, u32>(r, n).await?)),
-            ColumnType::Int32 => Ok(DecodedColumn::Int32(read_le_column::<_, i32>(r, n).await?)),
+            // `Time` is signed seconds on the wire.
+            ColumnType::Int32 | ColumnType::Time => {
+                Ok(DecodedColumn::Int32(read_le_column::<_, i32>(r, n).await?))
+            }
             ColumnType::UInt64 => Ok(DecodedColumn::UInt64(read_le_column::<_, u64>(r, n).await?)),
-            ColumnType::Int64 => Ok(DecodedColumn::Int64(read_le_column::<_, i64>(r, n).await?)),
+            // `Time64` is signed ticks at the column's precision.
+            ColumnType::Int64 | ColumnType::Time64 => {
+                Ok(DecodedColumn::Int64(read_le_column::<_, i64>(r, n).await?))
+            }
             ColumnType::Int128 => Ok(DecodedColumn::Int128(
                 read_le_column::<_, i128>(r, n).await?,
             )),
@@ -1355,14 +1355,23 @@ fn decode_column<'a, R: ClickHouseRead + 'a>(
                 let cells = columns::read_dynamic_v1v2_body(r, n, &header, depth + 1).await?;
                 Ok(DecodedColumn::Json(unwrap_json_cells(cells)?))
             }
-            // BFloat16, Time, Time64 and Point have no typed variant yet; the
-            // wire bytes are still consumed so the stream pointer stays
-            // aligned, and per-row access on `Unsupported` errors instead of
-            // returning a placeholder.
-            other => {
-                let _consumed = columns::read_column_data(r, other, num_rows).await?;
-                Ok(DecodedColumn::Unsupported(format!("{other:?}")))
+            // `Tuple(Float64, Float64)` on the wire: every x, then every y.
+            ColumnType::Point => {
+                let x = read_le_column::<_, f64>(r, n).await?;
+                let y = read_le_column::<_, f64>(r, n).await?;
+                Ok(DecodedColumn::Tuple(vec![
+                    DecodedColumn::Float64(x),
+                    DecodedColumn::Float64(y),
+                ]))
             }
+            // The top 16 bits of an f32, so widening is exact.
+            ColumnType::BFloat16 => Ok(DecodedColumn::Float32(
+                read_le_column::<_, u16>(r, n)
+                    .await?
+                    .into_iter()
+                    .map(|bits| f32::from_bits(u32::from(bits) << 16))
+                    .collect(),
+            )),
         }
     })
 }
@@ -2190,6 +2199,60 @@ mod tests {
         let mut cur = Cursor::new(buf);
         let mut block = decode_block(&mut cur, 1, num_rows, REV).await.unwrap();
         block.columns.pop().unwrap()
+    }
+
+    /// `(type, rows, payload, what must decode)`: each reads to values a
+    /// caller can use, never a column that holds none.
+    #[tokio::test]
+    async fn bfloat16_time_time64_and_point_decode_to_values() {
+        let mut point = Vec::new();
+        for f in [1.5f64, -3.0, 2.5, 4.0] {
+            point.extend_from_slice(&f.to_le_bytes());
+        }
+        // 1.5 is 0x3FC0 in BFloat16, the top half of its f32 bits.
+        let bf16 = [0x3FC0u16, 0xC040]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<u8>>();
+        let time = [3_600i32, -1]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<u8>>();
+        let time64 = [1_500i64]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<u8>>();
+
+        match decode_one_typed("Point", 2, &point).await {
+            DecodedColumn::Tuple(fields) => match fields.as_slice() {
+                [DecodedColumn::Float64(x), DecodedColumn::Float64(y)] => {
+                    assert_eq!(x, &[1.5, -3.0]);
+                    assert_eq!(y, &[2.5, 4.0]);
+                }
+                other => panic!("Point fields: {other:?}"),
+            },
+            other => panic!("Point: {other:?}"),
+        }
+        match decode_one_typed("BFloat16", 2, &bf16).await {
+            DecodedColumn::Float32(v) => assert_eq!(v, [1.5, -3.0]),
+            other => panic!("BFloat16: {other:?}"),
+        }
+        match decode_one_typed("Time", 2, &time).await {
+            DecodedColumn::Int32(v) => assert_eq!(v, [3_600, -1]),
+            other => panic!("Time: {other:?}"),
+        }
+        match decode_one_typed("Time64(3)", 1, &time64).await {
+            DecodedColumn::Int64(v) => assert_eq!(v, [1_500]),
+            other => panic!("Time64: {other:?}"),
+        }
+        let ring = [2u64.to_le_bytes().to_vec(), point].concat();
+        match decode_one_typed("Ring", 1, &ring).await {
+            DecodedColumn::Array { offsets, child } => {
+                assert_eq!(offsets, [2]);
+                assert!(matches!(*child, DecodedColumn::Tuple(_)), "{child:?}");
+            }
+            other => panic!("Ring: {other:?}"),
+        }
     }
 
     fn le_bytes_i128(vals: &[i128]) -> Vec<u8> {
@@ -3153,8 +3216,7 @@ mod tests {
 
     /// Assert what a successful decode must satisfy: one column per schema
     /// entry, and every column exactly `rows` long. A decoder that fabricated
-    /// rows the wire never backed would fail the second. `Unsupported` is
-    /// exempt because it deliberately reports zero rows (`:314-316`).
+    /// rows the wire never backed would fail the second.
     fn assert_block_is_consistent(
         block: &DecodedBlock,
         rows: u64,
@@ -3162,9 +3224,6 @@ mod tests {
         use proptest::prelude::*;
         prop_assert_eq!(block.schema.len(), block.columns.len());
         for column in &block.columns {
-            if matches!(column, DecodedColumn::Unsupported(_)) {
-                continue;
-            }
             let got = u64::try_from(column.row_count()).expect("row count fits u64");
             prop_assert_eq!(got, rows);
         }
