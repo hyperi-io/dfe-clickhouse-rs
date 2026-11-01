@@ -33,4 +33,7 @@ pub use error::DynamicError;
 pub use insert::DynamicInsert;
 pub use parsed_type::{ParsedType, TypeTag};
 pub use schema::{DynamicSchema, DynamicSchemaCache, fetch_dynamic_schema};
-pub use shape::{JSON_ARRAY_WRAPPER_KEY, JSON_SCALAR_WRAPPER_KEY, shape_json_value};
+pub use shape::{
+    JSON_ARRAY_WRAPPER_KEY, JSON_SCALAR_WRAPPER_KEY, needs_shaping, shape_for_type,
+    shape_json_value, shaping_changes,
+};

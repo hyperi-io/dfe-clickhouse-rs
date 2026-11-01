@@ -10,12 +10,14 @@
 //!
 //! The RowBinary encoder applies them as it writes each column. A caller that
 //! serialises the row map itself, as a JSONEachRow body does, applies them to
-//! the map first with [`shape_json_value`].
+//! the map first with [`shape_for_type`], for the columns [`needs_shaping`]
+//! names.
 
 use std::borrow::Cow;
 
 use serde_json::{Map, Value};
 
+use super::datetime;
 use super::parsed_type::{ParsedType, TypeTag};
 
 /// The key a root-level array is stored under in a JSON column.
@@ -149,6 +151,115 @@ fn wrap_json_text(key: &str, json: &str) -> Vec<u8> {
     out.extend_from_slice(json.as_bytes());
     out.push(b'}');
     out
+}
+
+/// Whether a column's values can need [`shape_for_type`] before a JSONEachRow
+/// body carries them: a JSON, a `Point`, an `Array` or a date-time, alone or
+/// as a `Map` value.
+#[must_use]
+pub fn needs_shaping(ty: &ParsedType) -> bool {
+    match ty.tag {
+        TypeTag::JSON
+        | TypeTag::Point
+        | TypeTag::Array
+        | TypeTag::DateTime
+        | TypeTag::DateTime64 => true,
+        TypeTag::Map => ty.map_types.as_ref().is_some_and(|(_, v)| needs_shaping(v)),
+        _ => false,
+    }
+}
+
+/// Shape a value into the form its column reads from a JSONEachRow body, by
+/// the rules the RowBinary encoder applies at the same depths: the JSON column
+/// rule, any geo_point form for a `Point`, one value for an `Array`, and zoned
+/// or over-precise text for a date-time.
+///
+/// A value no rule reads is left as it is, for the server to refuse.
+pub fn shape_for_type(value: &mut Value, ty: &ParsedType) {
+    if ty.nullable && value.is_null() {
+        return;
+    }
+    match ty.tag {
+        TypeTag::JSON => shape_json_value(value),
+        TypeTag::DateTime | TypeTag::DateTime64 => {
+            if let Value::String(text) = value
+                && let Some(wire) = datetime::wire_text(text, datetime_precision(ty))
+            {
+                *text = wire;
+            }
+        }
+        TypeTag::Point => {
+            if let Ok((lon, lat)) = geo_point_lon_lat(value) {
+                *value = Value::Array(vec![Value::from(lon), Value::from(lat)]);
+            }
+        }
+        TypeTag::Array => {
+            let Some(element) = ty.array_element.as_deref() else {
+                return;
+            };
+            if is_single_element(value, element) {
+                *value = Value::Array(vec![value.take()]);
+            }
+            if let Value::Array(items) = value {
+                for item in items {
+                    shape_for_type(item, element);
+                }
+            }
+        }
+        TypeTag::Map => {
+            if let (Some((_, value_type)), Value::Object(entries)) =
+                (ty.map_types.as_ref(), &mut *value)
+            {
+                for (_, entry) in entries {
+                    shape_for_type(entry, value_type);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether [`shape_for_type`] would change this value, so a caller clones only
+/// the rows it has to touch.
+#[must_use]
+pub fn shaping_changes(value: &Value, ty: &ParsedType) -> bool {
+    if ty.nullable && value.is_null() {
+        return false;
+    }
+    match ty.tag {
+        TypeTag::JSON => !value.is_object(),
+        TypeTag::DateTime | TypeTag::DateTime64 => value
+            .as_str()
+            .is_some_and(|text| datetime::wire_text_differs(text, datetime_precision(ty))),
+        TypeTag::Point => {
+            let already_pair = matches!(value, Value::Array(items)
+                if items.len() == 2 && items.iter().all(Value::is_number));
+            !already_pair && geo_point_lon_lat(value).is_ok()
+        }
+        TypeTag::Array => match (ty.array_element.as_deref(), value) {
+            (Some(element), _) if is_single_element(value, element) => true,
+            (Some(element), Value::Array(items)) => {
+                items.iter().any(|item| shaping_changes(item, element))
+            }
+            _ => false,
+        },
+        TypeTag::Map => match (ty.map_types.as_ref(), value) {
+            (Some((_, value_type)), Value::Object(entries)) => entries
+                .iter()
+                .any(|(_, entry)| shaping_changes(entry, value_type)),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Fraction digits a date-time column holds: none for a `DateTime`, and 3 for
+/// a `DateTime64` whose precision did not parse, as ClickHouse defaults it.
+fn datetime_precision(ty: &ParsedType) -> u8 {
+    match ty.tag {
+        TypeTag::DateTime64 => ty.precision.unwrap_or(3),
+        _ => 0,
+    }
 }
 
 /// Whether `value`, bound for an `Array(elem)`, is one element rather than the
@@ -358,6 +469,56 @@ mod tests {
             shape_json_value(&mut shaped_now);
             assert_eq!(shaped_now, shaped, "{value}");
         }
+    }
+
+    /// `(type, value in, value the JSONEachRow body carries)`. Where shaping
+    /// changes nothing, `shaping_changes` says so.
+    #[test]
+    fn shape_for_type_and_its_change_check_agree() {
+        for (ty, before, after) in [
+            ("JSON", json!(["a"]), json!({"list": ["a"]})),
+            ("JSON", json!({"a": 1}), json!({"a": 1})),
+            (
+                "DateTime64(3)",
+                json!("2026-04-07T17:03:00.123+10:00"),
+                json!("1775545380.123"),
+            ),
+            (
+                "DateTime",
+                json!("2026-04-07 07:03:00.5"),
+                json!("2026-04-07 07:03:00"),
+            ),
+            (
+                "DateTime64(3)",
+                json!("2026-04-07 07:03:00.123"),
+                json!("2026-04-07 07:03:00.123"),
+            ),
+            ("Point", json!("41.12,-71.34"), json!([-71.34, 41.12])),
+            ("Point", json!([1.5, 2.5]), json!([1.5, 2.5])),
+            ("Array(String)", json!("one"), json!(["one"])),
+            ("Array(String)", json!(["one"]), json!(["one"])),
+            ("Array(Point)", json!([1.5, 2.5]), json!([[1.5, 2.5]])),
+            (
+                "Map(String, JSON)",
+                json!({"k": 7}),
+                json!({"k": {"value": 7}}),
+            ),
+            ("Nullable(JSON)", Value::Null, Value::Null),
+            ("UInt8", json!(7), json!(7)),
+        ] {
+            let parsed = ParsedType::parse(ty);
+            assert_eq!(
+                shaping_changes(&before, &parsed),
+                before != after,
+                "{ty}: {before}"
+            );
+            let mut shaped = before.clone();
+            shape_for_type(&mut shaped, &parsed);
+            assert_eq!(shaped, after, "{ty}: {before}");
+        }
+        assert!(needs_shaping(&ParsedType::parse("Map(String, Point)")));
+        assert!(!needs_shaping(&ParsedType::parse("Map(String, String)")));
+        assert!(!needs_shaping(&ParsedType::parse("UInt64")));
     }
 
     /// `(value, element type, one element)`.

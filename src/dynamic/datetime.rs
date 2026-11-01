@@ -10,7 +10,9 @@
 //!
 //! [`parse`] reads `YYYY-MM-DD[T| ]HH:MM:SS[.fraction][Z|+-HH[:MM]]`. Text with
 //! no zone is UTC, and text that names one is moved to UTC. The RowBinary
-//! encoder writes the instant as ticks.
+//! encoder writes the instant as ticks, the JSONEachRow shaping step as epoch
+//! text ([`wire_text`]), because ClickHouse reads zone-less text in the
+//! column's timezone and epoch seconds name one instant whatever that is.
 
 /// An instant read from date-time text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +132,86 @@ impl UtcInstant {
         self.secs
             .checked_mul(10_i64.pow(precision))?
             .checked_add(i64::from(self.nanos) / 10_i64.pow(9 - precision))
+    }
+
+    /// The instant as epoch seconds text with `precision` fraction digits.
+    fn epoch_text(self, precision: u8) -> Option<String> {
+        let precision = precision.min(MAX_PRECISION);
+        let ticks = self.ticks(precision)?;
+        let scale = 10_u64.pow(u32::from(precision));
+        let sign = if ticks < 0 { "-" } else { "" };
+        let (whole, frac) = (ticks.unsigned_abs() / scale, ticks.unsigned_abs() % scale);
+        Some(if precision == 0 {
+            format!("{sign}{whole}")
+        } else {
+            format!(
+                "{sign}{whole}.{frac:0width$}",
+                width = usize::from(precision)
+            )
+        })
+    }
+}
+
+/// Whether text could end in a zone: a `Z`, or a sign in the last six bytes.
+fn may_name_zone(text: &str) -> bool {
+    let b = text.as_bytes();
+    b.len() > WHOLE_SECONDS_LEN
+        && (matches!(b[b.len() - 1], b'Z' | b'z')
+            || b[b.len() - 6..].iter().any(|c| matches!(c, b'+' | b'-')))
+}
+
+/// How text bound for a JSONEachRow body must change.
+enum Rewrite {
+    /// The server reads it as it stands.
+    Keep,
+    /// It names its zone, which the default reader refuses with code 27.
+    Epoch(UtcInstant),
+    /// Zone-less, with fraction digits the column does not hold: cut it here.
+    Cut(usize),
+}
+
+fn rewrite(text: &str, precision: u8) -> Rewrite {
+    let b = text.as_bytes();
+    let fraction = match b.get(WHOLE_SECONDS_LEN) {
+        Some(b'.') => b[WHOLE_SECONDS_LEN + 1..]
+            .iter()
+            .take_while(|c| c.is_ascii_digit())
+            .count(),
+        _ => 0,
+    };
+    if !may_name_zone(text) && fraction <= usize::from(precision) {
+        return Rewrite::Keep;
+    }
+    match parse(text) {
+        Ok(instant) if instant.zoned => Rewrite::Epoch(instant),
+        Ok(_) if precision == 0 => Rewrite::Cut(WHOLE_SECONDS_LEN),
+        Ok(_) if fraction > usize::from(precision) => {
+            Rewrite::Cut(WHOLE_SECONDS_LEN + 1 + usize::from(precision))
+        }
+        Ok(_) | Err(_) => Rewrite::Keep,
+    }
+}
+
+/// The text a JSONEachRow body sends for a column holding `precision` fraction
+/// digits, or `None` when the server reads `text` as it stands.
+///
+/// A zoned value becomes epoch text. Zone-less text keeps its meaning and loses
+/// only the digits the column cannot hold, which a `DateTime` refuses.
+pub(crate) fn wire_text(text: &str, precision: u8) -> Option<String> {
+    match rewrite(text, precision) {
+        Rewrite::Keep => None,
+        Rewrite::Epoch(instant) => instant.epoch_text(precision),
+        // `parse` accepted the text, so every byte up to `len` is ASCII.
+        Rewrite::Cut(len) => Some(text[..len].to_string()),
+    }
+}
+
+/// Whether [`wire_text`] would change `text`, without building the result.
+pub(crate) fn wire_text_differs(text: &str, precision: u8) -> bool {
+    match rewrite(text, precision) {
+        Rewrite::Keep => false,
+        Rewrite::Epoch(instant) => instant.ticks(precision).is_some(),
+        Rewrite::Cut(_) => true,
     }
 }
 
@@ -263,5 +345,49 @@ mod tests {
         assert_eq!(i.ticks(6), Some(SECS * 1_000_000 + 123_456));
         assert_eq!(i.ticks(9), Some(SECS * 1_000_000_000 + 123_456_789));
         assert_eq!(instant("1969-12-31T23:59:58.750Z").ticks(3), Some(-1_250));
+    }
+
+    #[test]
+    fn epoch_text_holds_the_column_precision() {
+        let i = instant("2026-04-07T07:03:00.123456789Z");
+        assert_eq!(i.epoch_text(0).as_deref(), Some("1775545380"));
+        assert_eq!(i.epoch_text(3).as_deref(), Some("1775545380.123"));
+        assert_eq!(i.epoch_text(9).as_deref(), Some("1775545380.123456789"));
+    }
+
+    #[test]
+    fn epoch_text_before_1970_keeps_its_sign_on_the_whole_value() {
+        let i = instant("1969-12-31T23:59:58.750Z");
+        assert_eq!(i.ticks(3), Some(-1_250));
+        assert_eq!(i.epoch_text(3).as_deref(), Some("-1.250"));
+    }
+
+    #[test]
+    fn wire_text_and_its_change_check_agree() {
+        for (text, precision, wire) in [
+            ("2026-04-07T17:03:00.123+10:00", 3, Some("1775545380.123")),
+            ("2026-04-07T17:03:00.123+10:00", 0, Some("1775545380")),
+            ("2026-04-07 07:03:00.123", 0, Some("2026-04-07 07:03:00")),
+            (
+                "2026-04-07 07:03:00.123456",
+                3,
+                Some("2026-04-07 07:03:00.123"),
+            ),
+            ("2026-04-07 07:03:00.123", 3, None),
+            ("2026-04-07 07:03:00.123", 6, None),
+            ("2026-04-07T07:03:00", 3, None),
+            ("garbage that ends in Z", 3, None),
+        ] {
+            assert_eq!(
+                wire_text(text, precision).as_deref(),
+                wire,
+                "{text} at {precision}"
+            );
+            assert_eq!(
+                wire_text_differs(text, precision),
+                wire.is_some(),
+                "{text} at {precision}"
+            );
+        }
     }
 }
