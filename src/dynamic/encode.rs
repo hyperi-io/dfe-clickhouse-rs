@@ -648,17 +648,12 @@ fn decimal_tag_for_precision(precision: u8) -> TypeTag {
     }
 }
 
-/// 2^127, exact in f64. An `as i128` cast saturates past it, which would store
-/// the i128 maximum in place of the value.
-const I128_BOUND: f64 = 170_141_183_460_469_231_731_687_303_715_884_105_728.0;
-
 /// Compute the backing integer for a `Decimal(P, S)` by scaling the value by
 /// `10^scale`. The concrete width is applied by the caller.
 ///
 /// Scaling runs on the decimal TEXT, in i128, so a `Decimal128(38, 10)` keeps
-/// all 38 digits; f64 only has 15-17 and would round them away. A JSON number
-/// is stringified first, because serde_json's `Display` is the shortest text
-/// that round-trips the value.
+/// all 38 digits, where f64 holds 15-17. A JSON number is stringified first,
+/// because serde_json's `Display` is the shortest text that round-trips it.
 fn decimal_backing_i128(value: &Value, scale: u8, col: &str) -> Result<i128, DynamicError> {
     let text: Cow<'_, str> = match value {
         Value::Number(n) => Cow::Owned(n.to_string()),
@@ -666,69 +661,85 @@ fn decimal_backing_i128(value: &Value, scale: u8, col: &str) -> Result<i128, Dyn
         Value::Bool(b) => Cow::Borrowed(if *b { "1" } else { "0" }),
         _ => return Err(enc_err(col, "expected decimal number")),
     };
-    if let Some(backing) = decimal_from_text(&text, scale) {
-        return Ok(backing);
-    }
-    // A plain literal that missed overflowed i128, and f64 would round it into range.
-    let digits = text.trim_start_matches(['+', '-']);
-    if digits.bytes().any(|b| b.is_ascii_digit())
-        && digits.bytes().all(|b| b.is_ascii_digit() || b == b'.')
-    {
-        return Err(enc_err(col, "decimal out of range"));
-    }
-    // Exponent forms fall back to f64 scaling, which is lossy but still better
-    // than refusing the row.
-    let f = text
-        .parse::<f64>()
-        .map_err(|_| enc_err(col, "not parseable as a decimal"))?;
-    let scaled = f * 10f64.powi(i32::from(scale));
-    if !scaled.is_finite() || scaled >= I128_BOUND || scaled < -I128_BOUND {
-        return Err(enc_err(col, "decimal out of range after scaling"));
-    }
-    #[allow(clippy::cast_possible_truncation)]
-    Ok(scaled.round() as i128)
+    decimal_from_text(&text, scale).map_err(|m| enc_err(col, m))
 }
 
-/// Scale a plain `[+-]?digits[.digits]` literal by `10^scale` in i128, rounding
-/// the first dropped fractional digit half-up as ClickHouse does.
+/// Past this many integer digits a scaled value cannot fit i128, which holds
+/// 38 full digits.
+const I128_DIGITS: i64 = 39;
+
+/// Scale a `[+-]digits[.digits][e[+-]digits]` literal by `10^scale` in i128,
+/// rounding the first dropped digit half-up as ClickHouse does. The exponent
+/// moves the decimal point, so `1.5e3` is read as exactly as `1500`.
 ///
-/// `None` for anything that is not that shape (an exponent, a non-digit) or
-/// that overflows i128, leaving the caller to decide.
-fn decimal_from_text(text: &str, scale: u8) -> Option<i128> {
-    let (negative, digits) = match text.as_bytes().first()? {
-        b'-' => (true, &text[1..]),
-        b'+' => (false, &text[1..]),
-        _ => (false, text),
+/// # Errors
+///
+/// `"not parseable as a decimal"` for any other text, `NaN` and `inf`
+/// included, and `"decimal out of range"` past i128.
+fn decimal_from_text(text: &str, scale: u8) -> Result<i128, &'static str> {
+    const NOT_DECIMAL: &str = "not parseable as a decimal";
+    const OUT_OF_RANGE: &str = "decimal out of range";
+    let (negative, unsigned) = match text.as_bytes().first() {
+        Some(b'-') => (true, &text[1..]),
+        Some(b'+') => (false, &text[1..]),
+        Some(_) => (false, text),
+        None => return Err(NOT_DECIMAL),
     };
-    let (int_part, frac_part) = digits.split_once('.').unwrap_or((digits, ""));
-    if int_part.is_empty() && frac_part.is_empty() {
-        return None;
-    }
-    if !int_part.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    if !frac_part.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
+    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => {
+            let exponent: i32 = exponent.parse().map_err(|_| NOT_DECIMAL)?;
+            (mantissa, i64::from(exponent))
+        }
+        None => (unsigned, 0),
+    };
+    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if (int_part.is_empty() && frac_part.is_empty())
+        || !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(NOT_DECIMAL);
     }
 
-    let mut acc: i128 = if int_part.is_empty() {
-        0
-    } else {
-        int_part.parse().ok()?
-    };
-    let frac = frac_part.as_bytes();
-    for i in 0..usize::from(scale) {
-        let digit = i128::from(frac.get(i).map_or(0, |b| b - b'0'));
-        acc = acc.checked_mul(10)?.checked_add(digit)?;
+    // The digits with leading zeros dropped, and how many of them sit before
+    // the point once it is moved by the exponent and the scale.
+    let leading_zeros = int_part.bytes().take_while(|&b| b == b'0').count();
+    let digits: Vec<u8> = int_part.as_bytes()[leading_zeros..]
+        .iter()
+        .chain(frac_part.as_bytes())
+        .map(|b| b - b'0')
+        .collect();
+    if digits.iter().all(|&d| d == 0) {
+        return Ok(0);
     }
-    if frac.get(usize::from(scale)).is_some_and(|&b| b >= b'5') {
-        acc = acc.checked_add(1)?;
+    let int_digits = i64::try_from(int_part.len() - leading_zeros).map_err(|_| OUT_OF_RANGE)?;
+    let whole = int_digits + exponent + i64::from(scale);
+    if whole > I128_DIGITS {
+        return Err(OUT_OF_RANGE);
     }
-    if negative {
-        acc.checked_neg()
-    } else {
-        Some(acc)
+
+    let mut acc: i128 = 0;
+    for i in 0..whole.max(0) {
+        let digit = usize::try_from(i)
+            .ok()
+            .and_then(|i| digits.get(i))
+            .copied()
+            .unwrap_or(0);
+        acc = acc
+            .checked_mul(10)
+            .and_then(|a| a.checked_add(i128::from(digit)))
+            .ok_or(OUT_OF_RANGE)?;
     }
+    // The first digit dropped: the one at position `whole`, a zero when the
+    // value sits wholly below the scale.
+    let dropped = usize::try_from(whole)
+        .ok()
+        .and_then(|i| digits.get(i))
+        .copied()
+        .unwrap_or(0);
+    if dropped >= 5 {
+        acc = acc.checked_add(1).ok_or(OUT_OF_RANGE)?;
+    }
+    Ok(if negative { -acc } else { acc })
 }
 
 // ---------------------------------------------------------------------------
@@ -1868,15 +1879,14 @@ mod tests {
             ("Int8", json!(-200)),
             ("Int16", json!(40_000)),
             ("Int32", json!(3_000_000_000u64)),
-            // Past i128 the f64 fallback would saturate to the maximum.
+            // Past i128, in exponent form as in plain digits.
             ("Decimal128(38, 10)", json!("1e40")),
             ("Decimal128(2)", json!(1e60)),
             ("Decimal256(2)", json!("-1e60")),
             // A value wider than the column is an error, not a cut-down copy.
             ("FixedString(3)", json!("abcdef")),
             ("FixedString(2)", json!("\u{e9}\u{e9}\u{e9}")),
-            // One past each i128 edge: the exact parser overflows, and the
-            // f64 rounding of the text would land back on the edge.
+            // One past each i128 edge.
             (
                 "Decimal128(0)",
                 json!("170141183460469231731687303715884105728"),
@@ -1929,6 +1939,43 @@ mod tests {
             enc(json!({"d": 123.45}), &[("d", "Decimal(18, 2)")]),
             12_345i64.to_le_bytes()
         );
+    }
+
+    /// `(text, type, backing)`: an exponent moves the point exactly, never
+    /// through f64, and text that is no decimal is refused.
+    #[test]
+    fn decimal_exponent_forms_scale_exactly() {
+        for (text, ty, backing) in [
+            (
+                "1.2345678901234567891e19",
+                "Decimal128(0)",
+                12_345_678_901_234_567_891_i128,
+            ),
+            ("1.5E3", "Decimal128(2)", 150_000),
+            ("-1.2345e-2", "Decimal128(4)", -123),
+            ("1.25e-2", "Decimal128(3)", 13),
+            ("4e-9", "Decimal128(2)", 0),
+            ("0e2000000000", "Decimal128(2)", 0),
+            ("+2.5e+1", "Decimal128(0)", 25),
+        ] {
+            assert_eq!(
+                enc(json!({ "d": text }), &[("d", ty)]),
+                backing.to_le_bytes(),
+                "{text} into {ty}"
+            );
+        }
+        // A JSON float prints in exponent form past 1e21.
+        assert_eq!(
+            enc(json!({"d": 1e22}), &[("d", "Decimal128(0)")]),
+            10_000_000_000_000_000_000_000_i128.to_le_bytes()
+        );
+        for text in ["NaN", "inf", "1e", "e5", "1.2.3", "1e1.5", "", "-"] {
+            let e = enc_err_of(json!({ "d": text }), &[("d", "Decimal128(2)")]);
+            assert!(
+                format!("{e}").contains("not parseable as a decimal"),
+                "{text:?}: {e}"
+            );
+        }
     }
 
     /// A 19-byte string can carry a multibyte char, so the parser's byte
