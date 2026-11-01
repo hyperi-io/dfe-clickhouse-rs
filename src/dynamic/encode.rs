@@ -29,7 +29,7 @@
 //! calendar day and a non-ASCII datetime string all fail the row.
 
 use std::borrow::Cow;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use serde_json::{Map, Value};
 
@@ -980,7 +980,13 @@ fn encode_ipv4(value: &Value, col: &str, buf: &mut Vec<u8>) -> Result<(), Dynami
 
 fn encode_ipv6(value: &Value, col: &str, buf: &mut Vec<u8>) -> Result<(), DynamicError> {
     let s = value_to_str(value);
-    let addr: Ipv6Addr = s.parse().map_err(|_| enc_err(col, "invalid IPv6"))?;
+    // An IPv6 column takes an IPv4 literal as ClickHouse's `toIPv6` does:
+    // `172.17.3.4` is `::ffff:172.17.3.4`.
+    let addr: Ipv6Addr = match s.parse::<IpAddr>() {
+        Ok(IpAddr::V6(v6)) => v6,
+        Ok(IpAddr::V4(v4)) => v4.to_ipv6_mapped(),
+        Err(_) => return Err(enc_err(col, "invalid IP address")),
+    };
     // 16 octets in network byte order, written verbatim.
     buf.extend_from_slice(&addr.octets());
     Ok(())
@@ -1425,6 +1431,16 @@ mod tests {
         let bytes = enc(json!({"ip": "::1"}), &[("ip", "IPv6")]);
         let addr: Ipv6Addr = "::1".parse().unwrap();
         assert_eq!(bytes, addr.octets());
+
+        let mapped: Ipv6Addr = "::ffff:10.0.0.1".parse().unwrap();
+        assert_eq!(
+            enc(json!({"ip": "10.0.0.1"}), &[("ip", "IPv6")]),
+            mapped.octets()
+        );
+        assert!(matches!(
+            enc_err_of(json!({"ip": "10.0.0"}), &[("ip", "IPv6")]),
+            DynamicError::EncodingError { .. }
+        ));
     }
 
     // ---- Enum ----
