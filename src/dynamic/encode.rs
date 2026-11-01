@@ -20,30 +20,25 @@
 //!
 //! Coercions ClickHouse's JSONEachRow path cannot do server-side: epoch
 //! magnitude detection (ms/us/ns) and ISO-8601 'T'-separator handling for
-//! date/time types, hyphen-less UUID hex, and integer-to-dotted IPv4. All
-//! timestamps are UTC; a non-zero timezone offset is rejected, never dropped.
+//! date/time types, hyphen-less UUID hex, and integer-to-dotted IPv4. Date-time
+//! text with no zone is UTC, and an offset (`Z`, `+HH`, `+HHMM`, `+HH:MM`) is
+//! applied, so the stored instant is the one the source named.
 //!
 //! A coercion that would lose information is an error, not a silent write: an
 //! out-of-range integer, a decimal past its backing width, an impossible
 //! calendar day and a non-ASCII datetime string all fail the row.
 
 use std::borrow::Cow;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use serde_json::{Map, Value};
 
 use crate::native::io::ClickHouseBytesWrite;
 
+use super::datetime::{self, civil_days_from_epoch, days_in_month};
 use super::error::DynamicError;
 use super::parsed_type::{ParsedType, TypeTag};
-
-/// The key a root-level JSON array is stored under in a `ClickHouse` JSON
-/// column.
-///
-/// The underscore prefix marks a field the writer injected rather than one the
-/// source carried, so a reader can tell the wrapper apart from an object that
-/// genuinely had a `values` key.
-pub const JSON_ARRAY_WRAPPER_KEY: &str = "_values";
+use super::shape::{geo_point_lon_lat, is_single_element, json_column_text};
 
 /// A single resolved column for a dynamic insert.
 #[derive(Debug, Clone)]
@@ -397,21 +392,9 @@ fn encode_typed(
             encode_map(value, kt, vt, col, buf)?;
         }
         TypeTag::Point => encode_point(value, col, buf)?,
-        TypeTag::JSON => {
-            // JSON goes on the wire as a length-prefixed String of JSON text. A
-            // Value::String is already that text, so it is written verbatim.
-            // Missing and empty become `{}`, because the column's JSON parser
-            // rejects the text `null` and empty input (code 117). A root-level
-            // array is wrapped -- see `wrap_root_array`.
-            let json_bytes = match value {
-                Value::Null => Cow::Borrowed("{}".as_bytes()),
-                Value::String(s) if s.is_empty() => Cow::Borrowed("{}".as_bytes()),
-                Value::String(s) => Cow::Borrowed(s.as_bytes()),
-                Value::Array(_) => Cow::Owned(wrap_root_array(value, col)?),
-                _ => Cow::Owned(value.to_string().into_bytes()),
-            };
-            buf.put_string(&json_bytes);
-        }
+        // JSON goes on the wire as a length-prefixed String of JSON text, in
+        // the form `shape::json_column_text` gives any value.
+        TypeTag::JSON => buf.put_string(json_column_text(value)),
         // Variant, Dynamic, Tuple and anything the parser did not recognise
         // have no encoding here. Reject rather than write bytes the server
         // would read as a different value.
@@ -422,24 +405,13 @@ fn encode_typed(
     Ok(())
 }
 
-/// A `Point` as `RowBinary`: x then y, each a little-endian `Float64`.
-///
-/// Takes a `[x, y]` pair, the GeoJSON order, or the `{"lat", "lon"}` object an
-/// Elastic `geo_point` carries, with longitude as x.
+/// A `Point` as `RowBinary`: x then y, each a little-endian `Float64`, with
+/// longitude as x. Any form [`geo_point_lon_lat`] reads, inside the
+/// coordinate ranges.
 fn encode_point(value: &Value, col: &str, buf: &mut Vec<u8>) -> Result<(), DynamicError> {
-    let (x, y) = match value {
-        Value::Array(pair) => match pair.as_slice() {
-            [x, y] => (x, y),
-            _ => return Err(enc_err(col, "Point needs exactly two coordinates")),
-        },
-        Value::Object(obj) => match (obj.get("lon"), obj.get("lat")) {
-            (Some(lon), Some(lat)) => (lon, lat),
-            _ => return Err(enc_err(col, "Point object needs both lat and lon")),
-        },
-        _ => return Err(enc_err(col, "Point needs [x, y] or {lat, lon}")),
-    };
-    buf.extend_from_slice(&as_f64(x, col)?.to_le_bytes());
-    buf.extend_from_slice(&as_f64(y, col)?.to_le_bytes());
+    let (lon, lat) = geo_point_lon_lat(value).map_err(|m| enc_err(col, m))?;
+    buf.extend_from_slice(&lon.to_le_bytes());
+    buf.extend_from_slice(&lat.to_le_bytes());
     Ok(())
 }
 
@@ -487,24 +459,6 @@ fn write_default(pt: &ParsedType, col: &str, buf: &mut Vec<u8>) -> Result<(), Dy
         buf.put_var_uint(0);
     }
     Ok(())
-}
-
-/// Render a root-level array as the JSON text `{"_values": [...]}`.
-///
-/// ClickHouse's JSON type parses only an object at its root and rejects an
-/// array with code 117 (`JSON object should start with '{'`), which would
-/// otherwise make an array-valued field such as ECS `tags` unwritable. Only the
-/// root is reshaped: an array nested inside an object already parses, and lands
-/// as a `Dynamic` holding `Array(...)`.
-fn wrap_root_array(array: &Value, col: &str) -> Result<Vec<u8>, DynamicError> {
-    let mut out = Vec::with_capacity(64);
-    out.extend_from_slice(b"{\"");
-    out.extend_from_slice(JSON_ARRAY_WRAPPER_KEY.as_bytes());
-    out.extend_from_slice(b"\":");
-    serde_json::to_writer(&mut out, array)
-        .map_err(|e| enc_err(col, &format!("JSON array not serialisable: {e}")))?;
-    out.push(b'}');
-    Ok(out)
 }
 
 fn enc_err(col: &str, msg: &str) -> DynamicError {
@@ -694,17 +648,12 @@ fn decimal_tag_for_precision(precision: u8) -> TypeTag {
     }
 }
 
-/// 2^127, exact in f64. An `as i128` cast saturates past it, which would store
-/// the i128 maximum in place of the value.
-const I128_BOUND: f64 = 170_141_183_460_469_231_731_687_303_715_884_105_728.0;
-
 /// Compute the backing integer for a `Decimal(P, S)` by scaling the value by
 /// `10^scale`. The concrete width is applied by the caller.
 ///
 /// Scaling runs on the decimal TEXT, in i128, so a `Decimal128(38, 10)` keeps
-/// all 38 digits; f64 only has 15-17 and would round them away. A JSON number
-/// is stringified first, because serde_json's `Display` is the shortest text
-/// that round-trips the value.
+/// all 38 digits, where f64 holds 15-17. A JSON number is stringified first,
+/// because serde_json's `Display` is the shortest text that round-trips it.
 fn decimal_backing_i128(value: &Value, scale: u8, col: &str) -> Result<i128, DynamicError> {
     let text: Cow<'_, str> = match value {
         Value::Number(n) => Cow::Owned(n.to_string()),
@@ -712,69 +661,85 @@ fn decimal_backing_i128(value: &Value, scale: u8, col: &str) -> Result<i128, Dyn
         Value::Bool(b) => Cow::Borrowed(if *b { "1" } else { "0" }),
         _ => return Err(enc_err(col, "expected decimal number")),
     };
-    if let Some(backing) = decimal_from_text(&text, scale) {
-        return Ok(backing);
-    }
-    // A plain literal that missed overflowed i128, and f64 would round it into range.
-    let digits = text.trim_start_matches(['+', '-']);
-    if digits.bytes().any(|b| b.is_ascii_digit())
-        && digits.bytes().all(|b| b.is_ascii_digit() || b == b'.')
-    {
-        return Err(enc_err(col, "decimal out of range"));
-    }
-    // Exponent forms fall back to f64 scaling, which is lossy but still better
-    // than refusing the row.
-    let f = text
-        .parse::<f64>()
-        .map_err(|_| enc_err(col, "not parseable as a decimal"))?;
-    let scaled = f * 10f64.powi(i32::from(scale));
-    if !scaled.is_finite() || scaled >= I128_BOUND || scaled < -I128_BOUND {
-        return Err(enc_err(col, "decimal out of range after scaling"));
-    }
-    #[allow(clippy::cast_possible_truncation)]
-    Ok(scaled.round() as i128)
+    decimal_from_text(&text, scale).map_err(|m| enc_err(col, m))
 }
 
-/// Scale a plain `[+-]?digits[.digits]` literal by `10^scale` in i128, rounding
-/// the first dropped fractional digit half-up as ClickHouse does.
+/// Past this many integer digits a scaled value cannot fit i128, which holds
+/// 38 full digits.
+const I128_DIGITS: i64 = 39;
+
+/// Scale a `[+-]digits[.digits][e[+-]digits]` literal by `10^scale` in i128,
+/// rounding the first dropped digit half-up as ClickHouse does. The exponent
+/// moves the decimal point, so `1.5e3` is read as exactly as `1500`.
 ///
-/// `None` for anything that is not that shape (an exponent, a non-digit) or
-/// that overflows i128, leaving the caller to decide.
-fn decimal_from_text(text: &str, scale: u8) -> Option<i128> {
-    let (negative, digits) = match text.as_bytes().first()? {
-        b'-' => (true, &text[1..]),
-        b'+' => (false, &text[1..]),
-        _ => (false, text),
+/// # Errors
+///
+/// `"not parseable as a decimal"` for any other text, `NaN` and `inf`
+/// included, and `"decimal out of range"` past i128.
+fn decimal_from_text(text: &str, scale: u8) -> Result<i128, &'static str> {
+    const NOT_DECIMAL: &str = "not parseable as a decimal";
+    const OUT_OF_RANGE: &str = "decimal out of range";
+    let (negative, unsigned) = match text.as_bytes().first() {
+        Some(b'-') => (true, &text[1..]),
+        Some(b'+') => (false, &text[1..]),
+        Some(_) => (false, text),
+        None => return Err(NOT_DECIMAL),
     };
-    let (int_part, frac_part) = digits.split_once('.').unwrap_or((digits, ""));
-    if int_part.is_empty() && frac_part.is_empty() {
-        return None;
-    }
-    if !int_part.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    if !frac_part.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
+    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => {
+            let exponent: i32 = exponent.parse().map_err(|_| NOT_DECIMAL)?;
+            (mantissa, i64::from(exponent))
+        }
+        None => (unsigned, 0),
+    };
+    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if (int_part.is_empty() && frac_part.is_empty())
+        || !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(NOT_DECIMAL);
     }
 
-    let mut acc: i128 = if int_part.is_empty() {
-        0
-    } else {
-        int_part.parse().ok()?
-    };
-    let frac = frac_part.as_bytes();
-    for i in 0..usize::from(scale) {
-        let digit = i128::from(frac.get(i).map_or(0, |b| b - b'0'));
-        acc = acc.checked_mul(10)?.checked_add(digit)?;
+    // The digits with leading zeros dropped, and how many of them sit before
+    // the point once it is moved by the exponent and the scale.
+    let leading_zeros = int_part.bytes().take_while(|&b| b == b'0').count();
+    let digits: Vec<u8> = int_part.as_bytes()[leading_zeros..]
+        .iter()
+        .chain(frac_part.as_bytes())
+        .map(|b| b - b'0')
+        .collect();
+    if digits.iter().all(|&d| d == 0) {
+        return Ok(0);
     }
-    if frac.get(usize::from(scale)).is_some_and(|&b| b >= b'5') {
-        acc = acc.checked_add(1)?;
+    let int_digits = i64::try_from(int_part.len() - leading_zeros).map_err(|_| OUT_OF_RANGE)?;
+    let whole = int_digits + exponent + i64::from(scale);
+    if whole > I128_DIGITS {
+        return Err(OUT_OF_RANGE);
     }
-    if negative {
-        acc.checked_neg()
-    } else {
-        Some(acc)
+
+    let mut acc: i128 = 0;
+    for i in 0..whole.max(0) {
+        let digit = usize::try_from(i)
+            .ok()
+            .and_then(|i| digits.get(i))
+            .copied()
+            .unwrap_or(0);
+        acc = acc
+            .checked_mul(10)
+            .and_then(|a| a.checked_add(i128::from(digit)))
+            .ok_or(OUT_OF_RANGE)?;
     }
+    // The first digit dropped: the one at position `whole`, a zero when the
+    // value sits wholly below the scale.
+    let dropped = usize::try_from(whole)
+        .ok()
+        .and_then(|i| digits.get(i))
+        .copied()
+        .unwrap_or(0);
+    if dropped >= 5 {
+        acc = acc.checked_add(1).ok_or(OUT_OF_RANGE)?;
+    }
+    Ok(if negative { -acc } else { acc })
 }
 
 // ---------------------------------------------------------------------------
@@ -793,21 +758,10 @@ fn epoch_to_seconds(ts: i64) -> i64 {
     }
 }
 
-/// Days in `month` of `year`, proleptic Gregorian.
-fn days_in_month(year: i32, month: u32) -> u32 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
-        2 => 28,
-        _ => 0,
-    }
-}
-
 /// Reject a date that does not exist -- `2026-02-31` would otherwise roll
 /// forward to `2026-03-03` and store a day nobody wrote.
 fn check_calendar_day(year: i32, month: u32, day: u32) -> bool {
-    (1..=12).contains(&month) && day >= 1 && day <= days_in_month(year, month)
+    u32::try_from(year).is_ok_and(|year| day >= 1 && day <= days_in_month(year, month))
 }
 
 /// Resolve a JSON value to whole epoch seconds (UTC). Accepts a date/datetime
@@ -826,8 +780,7 @@ fn to_epoch_seconds(value: &Value, col: &str) -> Result<i64, DynamicError> {
             if let Ok(raw) = s.parse::<i64>() {
                 return Ok(epoch_to_seconds(raw));
             }
-            let (secs, _) = parse_datetime_str(s).map_err(|m| enc_err(col, &m))?;
-            Ok(secs)
+            Ok(datetime::parse(s).map_err(|m| enc_err(col, m))?.secs)
         }
         _ => Err(enc_err(col, "expected datetime string or epoch number")),
     }
@@ -863,201 +816,125 @@ fn to_epoch_days(value: &Value, col: &str) -> Result<i32, DynamicError> {
 }
 
 /// Convert a JSON value to `DateTime64` epoch ticks at the given precision.
+///
+/// A number, or numeric text, is an epoch in seconds, milliseconds,
+/// microseconds or nanoseconds, told apart by magnitude as for `DateTime`, and
+/// rescaled to the column's precision: epoch milliseconds into a
+/// `DateTime64(6)` land at the instant they name.
 fn datetime64_to_ticks(value: &Value, precision: u8, col: &str) -> Result<i64, DynamicError> {
-    match value {
+    let epoch = match value {
         Value::Number(n) => n
             .as_i64()
             .or_else(|| n.as_f64().and_then(whole_f64_as_i64))
-            .ok_or_else(|| enc_err(col, "invalid DateTime64 number")),
+            .ok_or_else(|| enc_err(col, "invalid DateTime64 number"))?,
         Value::String(s) => {
             let s = s.trim();
-            // A numeric string is treated as an already-scaled tick count.
-            if let Ok(n) = s.parse::<i64>() {
-                return Ok(n);
-            }
-            let (secs, frac_nanos) = parse_datetime_str(s).map_err(|m| enc_err(col, &m))?;
-            let multiplier = 10i64.pow(u32::from(precision));
-            let base = secs
-                .checked_mul(multiplier)
-                .ok_or_else(|| enc_err(col, "DateTime64 epoch overflow"))?;
-            let frac_scaled =
-                i64::from(frac_nanos) / 10i64.pow(9u32.saturating_sub(u32::from(precision)));
-            base.checked_add(frac_scaled)
-                .ok_or_else(|| enc_err(col, "DateTime64 epoch overflow"))
-        }
-        _ => Err(enc_err(col, "expected number or datetime string")),
-    }
-}
-
-/// Parse `YYYY-MM-DD[ T]HH:MM:SS[.frac][Z|+00:00]` into `(unix_seconds,
-/// fractional_nanoseconds)`. UTC only; non-zero offsets are rejected.
-fn parse_datetime_str(s: &str) -> Result<(i64, u32), String> {
-    let bytes = s.as_bytes();
-    let len = bytes.len();
-
-    if len < 19 {
-        return Err("invalid DateTime string".into());
-    }
-    // Every index below is a byte offset into `s`; without this a multibyte
-    // char inside a 19-byte string would split a char and panic.
-    if !s.is_ascii() {
-        return Err("invalid DateTime string".into());
-    }
-    let sep = bytes[10];
-    if sep != b' ' && sep != b'T' {
-        return Err("invalid DateTime string".into());
-    }
-
-    let mut pos = 19;
-
-    let frac_nanos = if pos < len && bytes[pos] == b'.' {
-        pos += 1;
-        let frac_start = pos;
-        while pos < len && bytes[pos].is_ascii_digit() {
-            pos += 1;
-        }
-        let frac_digits = pos - frac_start;
-        if frac_digits == 0 {
-            return Err("invalid DateTime string".into());
-        }
-        let clamped = frac_digits.min(9);
-        let frac_slice = &s[frac_start..frac_start + clamped];
-        let mut frac: u32 = frac_slice
-            .parse()
-            .map_err(|_| "invalid fractional seconds".to_string())?;
-        if clamped < 9 {
-            // `clamped` is at most 9 by the line above, so the exponent fits.
-            frac *= 10u32.pow(9 - u32::try_from(clamped).unwrap_or(9));
-        }
-        frac
-    } else {
-        0u32
-    };
-
-    if pos < len {
-        if bytes[pos] == b'Z' {
-            pos += 1;
-        } else if (bytes[pos] == b'+' || bytes[pos] == b'-') && pos + 6 <= len {
-            let sign = bytes[pos];
-            let tz_slice = &s[pos + 1..pos + 6];
-            if tz_slice.len() == 5
-                && tz_slice.as_bytes()[2] == b':'
-                && tz_slice[..2].bytes().all(|b| b.is_ascii_digit())
-                && tz_slice[3..].bytes().all(|b| b.is_ascii_digit())
-            {
-                if sign == b'-' || &tz_slice[..2] != "00" || &tz_slice[3..] != "00" {
-                    return Err(format!(
-                        "non-UTC timezone offset '{}{}' not supported; convert to UTC first",
-                        sign as char, tz_slice
-                    ));
+            match s.parse::<i64>() {
+                Ok(n) => n,
+                Err(_) => {
+                    return datetime::parse(s)
+                        .map_err(|m| enc_err(col, m))?
+                        .ticks(precision)
+                        .ok_or_else(|| enc_err(col, "DateTime64 epoch overflow"));
                 }
-                pos += 6;
             }
         }
-    }
-
-    if pos != len {
-        return Err("invalid DateTime string".into());
-    }
-
-    let year: i32 = s[0..4].parse().map_err(|_| "invalid year".to_string())?;
-    let month: u32 = s[5..7].parse().map_err(|_| "invalid month".to_string())?;
-    let day: u32 = s[8..10].parse().map_err(|_| "invalid day".to_string())?;
-    let hour: u32 = s[11..13].parse().map_err(|_| "invalid hour".to_string())?;
-    let min: u32 = s[14..16]
-        .parse()
-        .map_err(|_| "invalid minute".to_string())?;
-    let second: u32 = s[17..19]
-        .parse()
-        .map_err(|_| "invalid second".to_string())?;
-
-    if !check_calendar_day(year, month, day) || hour > 23 || min > 59 || second > 59 {
-        return Err("invalid DateTime string".into());
-    }
-
-    let days = civil_days_from_epoch(year, month, day);
-    let secs = days * 86_400 + i64::from(hour) * 3600 + i64::from(min) * 60 + i64::from(second);
-    Ok((secs, frac_nanos))
+        _ => return Err(enc_err(col, "expected number or datetime string")),
+    };
+    epoch_to_ticks(epoch, precision).ok_or_else(|| enc_err(col, "DateTime64 epoch overflow"))
 }
 
-/// Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm).
-fn civil_days_from_epoch(year: i32, month: u32, day: u32) -> i64 {
-    let y = i64::from(if month <= 2 { year - 1 } else { year });
-    let m = i64::from(if month <= 2 { month + 9 } else { month - 3 });
-    let era = y.div_euclid(400);
-    let yoe = y.rem_euclid(400);
-    let day_of_year = (153 * m + 2) / 5 + i64::from(day) - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + day_of_year;
-    era * 146_097 + doe - 719_468
+/// Rescale an epoch of magnitude-detected units (see [`epoch_to_seconds`]) to
+/// ticks of `precision` fraction digits. `None` past the range of `i64`.
+fn epoch_to_ticks(epoch: i64, precision: u8) -> Option<i64> {
+    let digits: u32 = match epoch.unsigned_abs() {
+        m if m > 1_000_000_000_000_000_000 => 9,
+        m if m > 1_000_000_000_000_000 => 6,
+        m if m > 1_000_000_000_000 => 3,
+        _ => 0,
+    };
+    let precision = u32::from(precision.min(9));
+    if precision >= digits {
+        epoch.checked_mul(10_i64.pow(precision - digits))
+    } else {
+        Some(epoch / 10_i64.pow(digits - precision))
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Enum
 // ---------------------------------------------------------------------------
 
-/// Resolve an enum value to its signed discriminant. A numeric value is used
-/// directly; a string is mapped via the `Enum8(...)` / `Enum16(...)` member
-/// list parsed from the type string.
-fn enum_discriminant(value: &Value, type_str: &str, col: &str) -> Result<i64, DynamicError> {
-    match value {
-        Value::Number(_) | Value::Bool(_) => as_i64(value, col),
-        Value::String(s) => {
-            // A numeric string is treated as the discriminant directly.
-            if let Ok(n) = s.trim().parse::<i64>() {
-                return Ok(n);
-            }
-            enum_member_value(type_str, s)
-                .ok_or_else(|| enc_err(col, "enum string not found in type definition"))
-        }
-        _ => Err(enc_err(col, "expected enum value")),
-    }
-}
-
-/// Look up `name` in an `Enum8(...)`/`Enum16(...)` definition, returning its
-/// integer discriminant. Members look like `'name' = 1` separated by commas.
+/// Resolve an enum value to the discriminant of one of the column's declared
+/// members. A number (or numeric string) must be a member's value and a
+/// string a member's name: the server stores any discriminant it is sent as
+/// RowBinary or Native, so an undeclared one is refused here as a bad value.
 ///
-/// The split is quote-aware: a member label may itself contain a comma, as in
-/// `Enum8('a,b' = 1)`.
-fn enum_member_value(type_str: &str, name: &str) -> Option<i64> {
-    let open = type_str.find('(')?;
-    let close = type_str.rfind(')')?;
-    if open >= close {
-        return None;
+/// The messages name neither the value nor the members, which are customer
+/// data.
+fn enum_discriminant(value: &Value, type_str: &str, col: &str) -> Result<i64, DynamicError> {
+    let members = enum_members(type_str);
+    let discriminant = match value {
+        Value::Number(_) | Value::Bool(_) => as_i64(value, col)?,
+        Value::String(s) => match s.trim().parse::<i64>() {
+            Ok(n) => n,
+            Err(_) => {
+                return members
+                    .iter()
+                    .find(|(label, _)| label == s)
+                    .map(|&(_, n)| n)
+                    .ok_or_else(|| enc_err(col, "enum string not found in type definition"));
+            }
+        },
+        _ => return Err(enc_err(col, "expected enum value")),
+    };
+    if members.iter().any(|&(_, n)| n == discriminant) {
+        Ok(discriminant)
+    } else {
+        Err(enc_err(
+            col,
+            "enum value is not one of the column's members",
+        ))
     }
-    for member in split_enum_members(&type_str[open + 1..close]) {
-        let (label, num) = member.split_once('=')?;
-        let label = label.trim().trim_matches('\'').trim_matches('"');
-        if label == name {
-            return num.trim().parse::<i64>().ok();
-        }
-    }
-    None
 }
 
-/// Split an enum member list on the commas that sit outside a quoted label.
-fn split_enum_members(inner: &str) -> Vec<&str> {
+/// The members of the `Enum8(...)` / `Enum16(...)` in `type_str`, wrapped or
+/// not (`Nullable(Enum8(...))`), as `(name, value)`. Members read
+/// `'name' = 1`, with `\'` and `\\` escapes inside the quotes, and a label
+/// may hold a comma.
+fn enum_members(type_str: &str) -> Vec<(String, i64)> {
+    let Some(start) = ["Enum8(", "Enum16("]
+        .iter()
+        .find_map(|head| type_str.find(head).map(|at| at + head.len()))
+    else {
+        return Vec::new();
+    };
     let mut members = Vec::new();
-    let mut quote: Option<char> = None;
-    let mut start = 0;
-    let mut escaped = false;
-    for (i, c) in inner.char_indices() {
-        if escaped {
-            escaped = false;
-        } else if c == '\\' && quote.is_some() {
-            escaped = true;
-        } else if let Some(q) = quote {
-            if c == q {
-                quote = None;
+    let mut chars = type_str[start..].chars().peekable();
+    loop {
+        while chars.next_if(|c| c.is_whitespace() || *c == ',').is_some() {}
+        if chars.next() != Some('\'') {
+            return members;
+        }
+        let mut name = String::new();
+        loop {
+            match chars.next() {
+                Some('\\') => name.extend(chars.next()),
+                Some('\'') => break,
+                Some(c) => name.push(c),
+                None => return members,
             }
-        } else if c == '\'' || c == '"' {
-            quote = Some(c);
-        } else if c == ',' {
-            members.push(&inner[start..i]);
-            start = i + 1;
+        }
+        while chars.next_if(|c| c.is_whitespace() || *c == '=').is_some() {}
+        let mut digits = String::new();
+        while let Some(c) = chars.next_if(|c| c.is_ascii_digit() || *c == '-') {
+            digits.push(c);
+        }
+        match digits.parse() {
+            Ok(value) => members.push((name, value)),
+            Err(_) => return members,
         }
     }
-    members.push(&inner[start..]);
-    members
 }
 
 // ---------------------------------------------------------------------------
@@ -1097,7 +974,13 @@ fn encode_ipv4(value: &Value, col: &str, buf: &mut Vec<u8>) -> Result<(), Dynami
 
 fn encode_ipv6(value: &Value, col: &str, buf: &mut Vec<u8>) -> Result<(), DynamicError> {
     let s = value_to_str(value);
-    let addr: Ipv6Addr = s.parse().map_err(|_| enc_err(col, "invalid IPv6"))?;
+    // An IPv6 column takes an IPv4 literal as ClickHouse's `toIPv6` does:
+    // `172.17.3.4` is `::ffff:172.17.3.4`.
+    let addr: Ipv6Addr = match s.parse::<IpAddr>() {
+        Ok(IpAddr::V6(v6)) => v6,
+        Ok(IpAddr::V4(v4)) => v4.to_ipv6_mapped(),
+        Err(_) => return Err(enc_err(col, "invalid IP address")),
+    };
     // 16 octets in network byte order, written verbatim.
     buf.extend_from_slice(&addr.octets());
     Ok(())
@@ -1107,12 +990,18 @@ fn encode_ipv6(value: &Value, col: &str, buf: &mut Vec<u8>) -> Result<(), Dynami
 // Array / Map
 // ---------------------------------------------------------------------------
 
+/// Write an `Array(elem)`. A single value the element takes is written as a
+/// one-element array.
 fn encode_array(
     value: &Value,
     elem: &ParsedType,
     col: &str,
     buf: &mut Vec<u8>,
 ) -> Result<(), DynamicError> {
+    if is_single_element(value, elem) {
+        buf.put_var_uint(1);
+        return encode_value(value, elem, col, buf);
+    }
     let Value::Array(arr) = value else {
         return Err(enc_err(col, "expected array"));
     };
@@ -1427,6 +1316,37 @@ mod tests {
         );
     }
 
+    /// `(epoch, precision, ticks)`: seconds, milliseconds, microseconds and
+    /// nanoseconds each land at the column's precision, pre-1970 too.
+    #[test]
+    fn a_numeric_epoch_is_rescaled_to_the_column_precision() {
+        for (epoch, precision, ticks) in [
+            (1_775_545_380_i64, 3, 1_775_545_380_000_i64),
+            (1_775_545_380_095, 6, 1_775_545_380_095_000),
+            (1_775_545_380_095_123, 3, 1_775_545_380_095),
+            (1_775_545_380_095_123_456, 9, 1_775_545_380_095_123_456),
+            (1_775_545_380_095_123_456, 0, 1_775_545_380),
+            (-1_775_545_380_095, 3, -1_775_545_380_095),
+        ] {
+            assert_eq!(
+                enc(
+                    json!({ "ts": epoch }),
+                    &[("ts", &format!("DateTime64({precision})"))]
+                ),
+                ticks.to_le_bytes(),
+                "{epoch} at {precision}"
+            );
+            assert_eq!(
+                enc(
+                    json!({ "ts": epoch.to_string() }),
+                    &[("ts", &format!("DateTime64({precision})"))]
+                ),
+                ticks.to_le_bytes(),
+                "text {epoch} at {precision}"
+            );
+        }
+    }
+
     #[test]
     fn datetime64_precision_6_and_9() {
         assert_eq!(
@@ -1445,13 +1365,23 @@ mod tests {
         );
     }
 
+    /// An offset moves the text to the instant it names, it is never dropped.
     #[test]
-    fn datetime64_rejects_nonzero_offset() {
-        let e = enc_err_of(
-            json!({"ts": "2026-04-07 07:03:00+05:30"}),
-            &[("ts", "DateTime64(3)")],
+    fn datetime64_applies_an_offset() {
+        assert_eq!(
+            enc(
+                json!({"ts": "2026-04-07 12:33:00.5+05:30"}),
+                &[("ts", "DateTime64(3)")]
+            ),
+            1_775_545_380_500i64.to_le_bytes()
         );
-        assert!(format!("{e}").contains("non-UTC"), "got: {e}");
+        assert_eq!(
+            enc(
+                json!({"ts": "2026-04-07T17:03:00+10"}),
+                &[("ts", "DateTime")]
+            ),
+            1_775_545_380u32.to_le_bytes()
+        );
     }
 
     // ---- Decimal ----
@@ -1532,6 +1462,16 @@ mod tests {
         let bytes = enc(json!({"ip": "::1"}), &[("ip", "IPv6")]);
         let addr: Ipv6Addr = "::1".parse().unwrap();
         assert_eq!(bytes, addr.octets());
+
+        let mapped: Ipv6Addr = "::ffff:10.0.0.1".parse().unwrap();
+        assert_eq!(
+            enc(json!({"ip": "10.0.0.1"}), &[("ip", "IPv6")]),
+            mapped.octets()
+        );
+        assert!(matches!(
+            enc_err_of(json!({"ip": "10.0.0"}), &[("ip", "IPv6")]),
+            DynamicError::EncodingError { .. }
+        ));
     }
 
     // ---- Enum ----
@@ -1573,6 +1513,37 @@ mod tests {
             matches!(e, DynamicError::EncodingError { .. }),
             "got: {e:?}"
         );
+    }
+
+    /// The server stores whatever discriminant it is sent, so a value that is
+    /// no member's is refused here.
+    #[test]
+    fn an_undeclared_enum_value_is_refused() {
+        for value in [json!(5), json!("4"), json!(-2), json!(true)] {
+            let e = enc_err_of(json!({ "e": value }), &[("e", "Enum8('a' = 2, 'b' = 3)")]);
+            assert!(
+                matches!(e, DynamicError::EncodingError { .. }),
+                "{value}: {e:?}"
+            );
+        }
+        assert_eq!(
+            enc(json!({"e": "3"}), &[("e", "Enum8('a' = 2, 'b' = 3)")]),
+            vec![3]
+        );
+    }
+
+    /// `(type, label, discriminant)`: a wrapper, a comma and an escaped quote
+    /// in a label, and a negative value all resolve.
+    #[test]
+    fn enum_labels_resolve_through_wrappers_and_escapes() {
+        for (ty, label, want) in [
+            ("Nullable(Enum8('on' = 1, 'off' = 2))", "off", vec![0, 2]),
+            ("Enum8('a,b' = 1, 'c' = 2)", "a,b", vec![1]),
+            (r"Enum8('it\'s' = 4)", "it's", vec![4]),
+            ("Enum8('neg' = -2, 'pos' = 2)", "neg", vec![0xfe]),
+        ] {
+            assert_eq!(enc(json!({ "e": label }), &[("e", ty)]), want, "{ty}");
+        }
     }
 
     // ---- Nullable ----
@@ -1704,13 +1675,15 @@ mod tests {
     }
 
     #[test]
-    fn point_refuses_anything_that_is_not_two_coordinates() {
+    fn point_refuses_anything_that_is_not_a_point_in_range() {
         for value in [
             json!([1.0]),
-            json!([1.0, 2.0, 3.0]),
+            json!([1.0, 2.0, 3.0, 4.0]),
             json!(["a", 2.0]),
             json!({"lat": 1.0}),
-            json!("POINT(1 2)"),
+            json!({"lat": 100, "lon": 0}),
+            json!([200, 0]),
+            json!("POINT(1)"),
             json!(7),
         ] {
             let err = enc_err_of(json!({ "p": value }), &[("p", "Point")]);
@@ -1792,13 +1765,9 @@ mod tests {
             json!({"_tags": ["beats", "filebeat"]}),
             &[("_tags", "JSON")],
         );
-        assert_eq!(bytes, json_col(r#"{"_values":["beats","filebeat"]}"#));
-    }
-
-    #[test]
-    fn json_empty_root_array_is_wrapped() {
+        assert_eq!(bytes, json_col(r#"{"list":["beats","filebeat"]}"#));
         let bytes = enc(json!({"_tags": []}), &[("_tags", "JSON")]);
-        assert_eq!(bytes, json_col(r#"{"_values":[]}"#));
+        assert_eq!(bytes, json_col(r#"{"list":[]}"#));
     }
 
     #[test]
@@ -1826,16 +1795,22 @@ mod tests {
     }
 
     #[test]
-    fn json_root_scalars_are_not_wrapped() {
-        assert_eq!(enc(json!({"d": 42}), &[("d", "JSON")]), json_col("42"));
-        assert_eq!(enc(json!({"d": true}), &[("d", "JSON")]), json_col("true"));
+    fn json_root_scalars_and_plain_text_are_wrapped() {
+        assert_eq!(
+            enc(json!({"d": 42}), &[("d", "JSON")]),
+            json_col(r#"{"value":42}"#)
+        );
+        assert_eq!(
+            enc(json!({"d": "plain"}), &[("d", "JSON")]),
+            json_col(r#"{"value":"plain"}"#)
+        );
     }
 
     #[test]
     fn nullable_json_root_array_is_wrapped() {
         let bytes = enc(json!({"t": ["a"]}), &[("t", "Nullable(JSON)")]);
         let mut expected = vec![0u8];
-        expected.extend_from_slice(&json_col(r#"{"_values":["a"]}"#));
+        expected.extend_from_slice(&json_col(r#"{"list":["a"]}"#));
         assert_eq!(bytes, expected);
     }
 
@@ -1959,15 +1934,14 @@ mod tests {
             ("Int8", json!(-200)),
             ("Int16", json!(40_000)),
             ("Int32", json!(3_000_000_000u64)),
-            // Past i128 the f64 fallback would saturate to the maximum.
+            // Past i128, in exponent form as in plain digits.
             ("Decimal128(38, 10)", json!("1e40")),
             ("Decimal128(2)", json!(1e60)),
             ("Decimal256(2)", json!("-1e60")),
             // A value wider than the column is an error, not a cut-down copy.
             ("FixedString(3)", json!("abcdef")),
             ("FixedString(2)", json!("\u{e9}\u{e9}\u{e9}")),
-            // One past each i128 edge: the exact parser overflows, and the
-            // f64 rounding of the text would land back on the edge.
+            // One past each i128 edge.
             (
                 "Decimal128(0)",
                 json!("170141183460469231731687303715884105728"),
@@ -2020,6 +1994,43 @@ mod tests {
             enc(json!({"d": 123.45}), &[("d", "Decimal(18, 2)")]),
             12_345i64.to_le_bytes()
         );
+    }
+
+    /// `(text, type, backing)`: an exponent moves the point exactly, never
+    /// through f64, and text that is no decimal is refused.
+    #[test]
+    fn decimal_exponent_forms_scale_exactly() {
+        for (text, ty, backing) in [
+            (
+                "1.2345678901234567891e19",
+                "Decimal128(0)",
+                12_345_678_901_234_567_891_i128,
+            ),
+            ("1.5E3", "Decimal128(2)", 150_000),
+            ("-1.2345e-2", "Decimal128(4)", -123),
+            ("1.25e-2", "Decimal128(3)", 13),
+            ("4e-9", "Decimal128(2)", 0),
+            ("0e2000000000", "Decimal128(2)", 0),
+            ("+2.5e+1", "Decimal128(0)", 25),
+        ] {
+            assert_eq!(
+                enc(json!({ "d": text }), &[("d", ty)]),
+                backing.to_le_bytes(),
+                "{text} into {ty}"
+            );
+        }
+        // A JSON float prints in exponent form past 1e21.
+        assert_eq!(
+            enc(json!({"d": 1e22}), &[("d", "Decimal128(0)")]),
+            10_000_000_000_000_000_000_000_i128.to_le_bytes()
+        );
+        for text in ["NaN", "inf", "1e", "e5", "1.2.3", "1e1.5", "", "-"] {
+            let e = enc_err_of(json!({ "d": text }), &[("d", "Decimal128(2)")]);
+            assert!(
+                format!("{e}").contains("not parseable as a decimal"),
+                "{text:?}: {e}"
+            );
+        }
     }
 
     /// A 19-byte string can carry a multibyte char, so the parser's byte

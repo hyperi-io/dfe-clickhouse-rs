@@ -11,8 +11,8 @@
 
 //! Schema reflection for dynamic inserts.
 //!
-//! Fetches column definitions from `system.columns` over `clickhouse::Client`
-//! and caches them with a TTL. Each column's parsed type (carried on
+//! Fetches column definitions from `system.columns`, over HTTP or the native
+//! protocol, and caches them with a TTL. Each column's parsed type (carried on
 //! [`ColumnDef`]) drives the runtime RowBinary encoding in [`super::encode`].
 
 use std::collections::HashMap;
@@ -24,6 +24,9 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use clickhouse::Client;
+
+#[cfg(feature = "tcp")]
+use crate::tcp::TcpClient;
 
 use super::encode::ColumnDef;
 use super::error::DynamicError;
@@ -95,6 +98,18 @@ impl DynamicSchema {
     pub fn has_json_columns(&self) -> bool {
         self.columns.iter().any(|c| c.ty.contains_json())
     }
+
+    /// Whether `other` has the same columns in the same order, each with the
+    /// same type and default kind. A caller holding the schema rows were
+    /// encoded against compares it with a fresh read to tell a rejection of
+    /// the rows from drift in the table.
+    #[must_use]
+    pub fn same_columns(&self, other: &DynamicSchema) -> bool {
+        self.columns.len() == other.columns.len()
+            && self.columns.iter().zip(&other.columns).all(|(a, b)| {
+                a.name == b.name && a.ty.raw == b.ty.raw && a.default_kind == b.default_kind
+            })
+    }
 }
 
 /// One row of the `system.columns` projection we query.
@@ -148,38 +163,107 @@ pub(crate) fn schema_from_system_columns(
     Ok(Arc::new(DynamicSchema::from_columns(full_table, columns)))
 }
 
-/// Fetch a table's schema from `system.columns` over HTTP.
+/// Fetch a table's schema from `system.columns` over HTTP, failing with
+/// [`crate::Error::TimedOut`] once `bound` passes.
 ///
 /// Columns come back in declaration order. Shared rather than owned, so the
 /// caller can hand the same schema to the cache and to an insert.
 ///
 /// # Errors
 ///
-/// Returns [`DynamicError::SchemaFetch`] if the query fails, or
+/// [`DynamicError::SchemaFetch`] if the query fails or runs past `bound`, or
 /// [`DynamicError::EmptySchema`] if the table has no columns (or does not
 /// exist).
 pub async fn fetch_dynamic_schema(
     client: &Client,
     database: &str,
     table: &str,
+    bound: Option<Duration>,
 ) -> Result<Arc<DynamicSchema>, DynamicError> {
     let full_table = format!("{database}.{table}");
-
-    let rows = client
-        .query_raw(&system_columns_sql(database, table))
-        .fetch_all::<SysColumn>()
+    let read = async {
+        Ok(client
+            .query_raw(&system_columns_sql(database, table))
+            .fetch_all::<SysColumn>()
+            .await?)
+    };
+    let rows = within(bound, read)
         .await
-        .map_err(|source| DynamicError::SchemaFetch {
-            table: full_table.clone(),
-            source,
-        })?;
-
+        .map_err(|source| fetch_failed(&full_table, source))?;
     schema_from_system_columns(
         full_table,
         rows.into_iter()
             .map(|r| (r.name, r.col_type, r.default_kind)),
     )
 }
+
+/// Fetch a table's schema from `system.columns` over the native protocol,
+/// failing with [`crate::Error::TimedOut`] once `bound` passes.
+///
+/// # Errors
+///
+/// As [`fetch_dynamic_schema`].
+#[cfg(feature = "tcp")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tcp")))]
+pub async fn fetch_dynamic_schema_tcp(
+    client: &TcpClient,
+    database: &str,
+    table: &str,
+    bound: Option<Duration>,
+) -> Result<Arc<DynamicSchema>, DynamicError> {
+    let full_table = format!("{database}.{table}");
+    let read = async {
+        let blocks = client
+            .query(&system_columns_sql(database, table))
+            .fetch_blocks()
+            .await?;
+        let mut rows = Vec::new();
+        for block in &blocks {
+            let names = block.column_as::<String>("name")?;
+            let types = block.column_as::<String>("col_type")?;
+            let kinds = block.column_as::<String>("default_kind")?;
+            rows.extend(
+                names
+                    .into_iter()
+                    .zip(types)
+                    .zip(kinds)
+                    .map(|((name, col_type), kind)| (name, col_type, kind)),
+            );
+        }
+        Ok(rows)
+    };
+    let rows = within(bound, read)
+        .await
+        .map_err(|source| fetch_failed(&full_table, source))?;
+    schema_from_system_columns(full_table, rows)
+}
+
+/// Run `read`, failing it with [`crate::Error::TimedOut`] once `bound` passes.
+///
+/// Dropping a TCP step mid-way is safe: an unsettled insert session poisons
+/// its connection on drop, so nothing reuses a half-written INSERT.
+pub(crate) async fn within<T>(
+    bound: Option<Duration>,
+    read: impl Future<Output = crate::Result<T>>,
+) -> crate::Result<T> {
+    match bound {
+        Some(bound) => tokio::time::timeout(bound, read)
+            .await
+            .unwrap_or(Err(crate::Error::TimedOut)),
+        None => read.await,
+    }
+}
+
+fn fetch_failed(full_table: &str, source: crate::Error) -> DynamicError {
+    DynamicError::SchemaFetch {
+        table: full_table.to_string(),
+        source: Box::new(source),
+    }
+}
+
+/// The most tables a [`DynamicSchemaCache`] holds. Past it the oldest entry
+/// makes room, so a caller writing to ever-new table names stays bounded.
+pub const MAX_CACHED_TABLES: usize = 10_000;
 
 /// TTL-based schema cache, safe to share across insert tasks via `Arc`.
 ///
@@ -197,6 +281,24 @@ struct CacheEntry {
 }
 
 impl DynamicSchemaCache {
+    /// Number of tables held, fresh or not yet dropped.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner.read().map_or(0, |g| g.len())
+    }
+
+    /// Whether the cache holds no tables.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// How long a fetched schema is served before it is fetched again.
+    #[must_use]
+    pub fn ttl(&self) -> Duration {
+        self.ttl
+    }
+
     /// Create a cache with the given freshness window, wrapped in `Arc`.
     #[must_use]
     pub fn new(ttl: Duration) -> Arc<Self> {
@@ -222,9 +324,20 @@ impl DynamicSchemaCache {
         })
     }
 
-    /// Insert or refresh a table's schema.
+    /// Insert or refresh a table's schema. Expired entries are dropped here,
+    /// and the oldest entry makes room once [`MAX_CACHED_TABLES`] are held.
     pub fn insert(&self, table: &str, schema: Arc<DynamicSchema>) {
         if let Ok(mut guard) = self.inner.write() {
+            guard.retain(|_, e| e.fetched_at.elapsed() < self.ttl);
+            if guard.len() >= MAX_CACHED_TABLES
+                && !guard.contains_key(table)
+                && let Some(oldest) = guard
+                    .iter()
+                    .min_by_key(|(_, e)| e.fetched_at)
+                    .map(|(name, _)| name.clone())
+            {
+                guard.remove(&oldest);
+            }
             guard.insert(
                 table.to_string(),
                 CacheEntry {
@@ -356,6 +469,30 @@ mod tests {
         assert!(cache.get("db.t").is_none(), "past the TTL");
     }
 
+    /// An expired entry is gone once anything is written, so a caller seeing
+    /// ever-new table names does not keep every schema it ever read, and the
+    /// cache holds at most its capacity, oldest out first.
+    #[tokio::test(start_paused = true)]
+    async fn the_cache_drops_expired_entries_and_holds_its_capacity() {
+        let cache = DynamicSchemaCache::new(Duration::from_secs(1));
+        cache.insert("db.old", shared("db.old", vec![col("id", "UInt64", "")]));
+        tokio::time::advance(Duration::from_secs(2)).await;
+        cache.insert("db.new", shared("db.new", vec![col("id", "UInt64", "")]));
+        assert_eq!(cache.len(), 1, "the expired entry went on the next write");
+
+        let cache = DynamicSchemaCache::new(Duration::from_secs(300));
+        for i in 0..=MAX_CACHED_TABLES {
+            cache.insert(
+                &format!("db.t{i}"),
+                shared("db.t", vec![col("id", "UInt64", "")]),
+            );
+            tokio::time::advance(Duration::from_millis(1)).await;
+        }
+        assert_eq!(cache.len(), MAX_CACHED_TABLES);
+        assert!(cache.get("db.t0").is_none(), "the oldest entry made room");
+        assert!(cache.get(&format!("db.t{MAX_CACHED_TABLES}")).is_some());
+    }
+
     #[test]
     fn cache_invalidate_all() {
         let cache = DynamicSchemaCache::new(Duration::from_secs(300));
@@ -394,5 +531,52 @@ mod tests {
             "{}",
             system_columns_sql("db", r"t\")
         );
+    }
+
+    /// A column added, dropped, retyped, re-defaulted or moved is a different
+    /// schema. The table name is not part of the comparison.
+    #[test]
+    fn same_columns_compares_name_type_default_and_order() {
+        let base = || vec![col("id", "UInt64", ""), col("_uuid", "UUID", "DEFAULT")];
+        let schema = DynamicSchema::from_columns("db.t", base());
+        assert!(schema.same_columns(&DynamicSchema::from_columns("db.other", base())));
+        for changed in [
+            vec![col("id", "UInt64", "")],
+            vec![col("id", "UInt32", ""), col("_uuid", "UUID", "DEFAULT")],
+            vec![col("id", "UInt64", ""), col("_uuid", "UUID", "")],
+            vec![col("_uuid", "UUID", "DEFAULT"), col("id", "UInt64", "")],
+            vec![
+                col("id", "UInt64", ""),
+                col("_uuid", "UUID", "DEFAULT"),
+                col("x", "UInt8", ""),
+            ],
+        ] {
+            let other = DynamicSchema::from_columns("db.t", changed);
+            assert!(!schema.same_columns(&other), "{:?}", other.columns);
+        }
+        assert_eq!(
+            DynamicSchemaCache::new(Duration::from_secs(7)).ttl(),
+            Duration::from_secs(7)
+        );
+    }
+
+    /// A server that accepts the connection and never answers: the bound ends
+    /// the read with a timed-out schema fetch, which is retriable.
+    #[tokio::test]
+    async fn a_bounded_schema_read_times_out_against_a_silent_server() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let held = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(sock);
+        });
+        let client = Client::default().with_url(format!("http://{addr}"));
+        let err = fetch_dynamic_schema(&client, "db", "t", Some(Duration::from_millis(200)))
+            .await
+            .expect_err("the server never answers");
+        assert!(err.is_timed_out(), "{err:?}");
+        assert!(err.is_retriable());
+        held.abort();
     }
 }

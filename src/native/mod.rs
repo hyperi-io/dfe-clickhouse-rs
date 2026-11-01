@@ -46,5 +46,5 @@ pub(crate) mod sparse;
 pub(crate) mod type_name;
 
 pub use columns::ColumnType;
-pub use decode::{DecodedBlock, DecodedColumn, FromColumn};
+pub use decode::{BlockKind, DecodedBlock, DecodedColumn, FromColumn};
 pub use encode::{ColumnSchema, encode_columns};

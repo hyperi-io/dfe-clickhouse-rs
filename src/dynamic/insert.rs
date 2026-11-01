@@ -35,9 +35,11 @@
 //! default.
 //!
 //! On a schema-mismatch error the HTTP path invalidates the cached schema so
-//! the next insert re-fetches.
+//! the next insert re-fetches, unless [`SchemaRefresh::AtExpiry`] says to keep
+//! it until its TTL. [`InsertTimeouts`] bounds each step on the client side.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use serde_json::{Map, Value};
@@ -47,6 +49,8 @@ use clickhouse::insert_formatted::InsertFormatted;
 
 use super::encode::{ColumnDef, DynamicRow};
 use super::error::DynamicError;
+#[cfg(feature = "tcp")]
+use super::schema::within;
 use super::schema::{DynamicSchema, DynamicSchemaCache, fetch_dynamic_schema};
 
 #[cfg(feature = "tcp")]
@@ -82,6 +86,37 @@ fn escape_ident(name: &str) -> String {
     out
 }
 
+/// Client-side bounds on one dynamic insert. `None` leaves a step unbounded
+/// here, under whatever bound the client itself carries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct InsertTimeouts {
+    /// Bound on the schema read, on opening the INSERT, and on handing over
+    /// each chunk or block.
+    pub send: Option<Duration>,
+    /// Bound on the server's answer once every row is sent.
+    pub end: Option<Duration>,
+}
+
+impl InsertTimeouts {
+    /// Bounds on sending and on the server's final answer.
+    #[must_use]
+    pub const fn new(send: Option<Duration>, end: Option<Duration>) -> Self {
+        Self { send, end }
+    }
+}
+
+/// What a schema-mismatch rejection does to the cached schema.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SchemaRefresh {
+    /// Drop it, so the next insert reads the table again.
+    #[default]
+    OnMismatch,
+    /// Keep it until the cache's TTL expires.
+    AtExpiry,
+}
+
 /// The client rows are written through, and where the schema comes from.
 enum Backend {
     Http {
@@ -89,7 +124,12 @@ enum Backend {
         cache: Arc<DynamicSchemaCache>,
     },
     #[cfg(feature = "tcp")]
-    Tcp(TcpClient),
+    Tcp {
+        client: TcpClient,
+        /// The cache the caller read the schema from, if any, so a mismatch
+        /// drops the entry there.
+        cache: Option<Arc<DynamicSchemaCache>>,
+    },
 }
 
 /// The sink carrying one INSERT.
@@ -183,6 +223,8 @@ pub struct DynamicInsert {
     schema: Option<Arc<DynamicSchema>>,
     active: Option<Active>,
     rows_written: u64,
+    timeouts: InsertTimeouts,
+    refresh: SchemaRefresh,
 }
 
 impl DynamicInsert {
@@ -204,6 +246,8 @@ impl DynamicInsert {
             schema: None,
             active: None,
             rows_written: 0,
+            timeouts: InsertTimeouts::default(),
+            refresh: SchemaRefresh::default(),
         }
     }
 
@@ -213,13 +257,42 @@ impl DynamicInsert {
     #[cfg(feature = "tcp")]
     pub fn tcp(client: TcpClient, database: &str, table: &str, schema: Arc<DynamicSchema>) -> Self {
         Self {
-            backend: Backend::Tcp(client),
+            backend: Backend::Tcp {
+                client,
+                cache: None,
+            },
             database: database.to_string(),
             table: table.to_string(),
             schema: Some(schema),
             active: None,
             rows_written: 0,
+            timeouts: InsertTimeouts::default(),
+            refresh: SchemaRefresh::default(),
         }
+    }
+
+    /// Name the cache a TCP insert's schema was read from, so a mismatch drops
+    /// it there and the next insert reads the table again. HTTP inserts
+    /// already hold their cache.
+    #[cfg(feature = "tcp")]
+    pub fn with_schema_cache(mut self, schema_cache: Arc<DynamicSchemaCache>) -> Self {
+        if let Backend::Tcp { cache, .. } = &mut self.backend {
+            *cache = Some(schema_cache);
+        }
+        self
+    }
+
+    /// Bound each step on the client side (default: unbounded here).
+    pub fn with_timeouts(mut self, timeouts: InsertTimeouts) -> Self {
+        self.timeouts = timeouts;
+        self
+    }
+
+    /// Say what a schema-mismatch rejection does to the cached schema
+    /// (default [`SchemaRefresh::OnMismatch`]).
+    pub fn with_schema_refresh(mut self, refresh: SchemaRefresh) -> Self {
+        self.refresh = refresh;
+        self
     }
 
     fn full_table(&self) -> String {
@@ -237,13 +310,21 @@ impl DynamicInsert {
                 if let Some(cached) = cache.get(&full) {
                     cached
                 } else {
-                    let fetched = fetch_dynamic_schema(client, &self.database, &self.table).await?;
+                    // Boxed: the read runs once per cache miss, and inline its
+                    // future would size every `write_map` future to match.
+                    let fetched = Box::pin(fetch_dynamic_schema(
+                        client,
+                        &self.database,
+                        &self.table,
+                        self.timeouts.send,
+                    ))
+                    .await?;
                     cache.insert(&full, Arc::clone(&fetched));
                     fetched
                 }
             }
             #[cfg(feature = "tcp")]
-            Backend::Tcp(_) => return Ok(()),
+            Backend::Tcp { .. } => return Ok(()),
         };
         self.schema = Some(schema);
         Ok(())
@@ -283,7 +364,7 @@ impl DynamicInsert {
         let columns = match &self.backend {
             Backend::Http { .. } => insertable_columns(schema),
             #[cfg(feature = "tcp")]
-            Backend::Tcp(_) => select_columns(row, raw_names, schema),
+            Backend::Tcp { .. } => select_columns(row, raw_names, schema),
         };
         if columns.is_empty() {
             return Err(DynamicError::EncodingError {
@@ -314,12 +395,14 @@ impl DynamicInsert {
                     client = client.with_setting(JSON_AS_STRING_SETTING, "1");
                 }
                 OpenSink::Http {
-                    insert: client.insert_formatted_with(sql),
+                    insert: client
+                        .insert_formatted_with(sql)
+                        .with_timeouts(self.timeouts.send, self.timeouts.end),
                     chunk: Vec::new(),
                 }
             }
             #[cfg(feature = "tcp")]
-            Backend::Tcp(client) => {
+            Backend::Tcp { client, .. } => {
                 let full = self.full_table();
                 let sql = format!("INSERT INTO {target} ({cols_sql}) FORMAT Native");
                 let headers: Vec<(String, String)> = columns
@@ -329,8 +412,7 @@ impl DynamicInsert {
                 let native =
                     ColumnSchema::from_headers(&headers).map_err(|e| classify_error(&full, e))?;
                 // Empty query id: the server allocates one.
-                let session = client
-                    .insert_native("", &sql)
+                let session = within(self.timeouts.send, client.insert_native("", &sql))
                     .await
                     .map_err(|e| classify_error(&full, e))?;
                 OpenSink::Tcp {
@@ -403,14 +485,21 @@ impl DynamicInsert {
                 .copied()
                 .eq(default_shape(row, raw_names, schema))
         {
-            self.commit().await?;
+            Box::pin(self.commit()).await?;
         }
-        self.ensure_active(row, raw_names).await?;
+        // Boxed, as the commit above: both run once per INSERT, and inline
+        // they would size every row's `write_map` future to match. The check
+        // keeps the allocation off rows that find the INSERT open.
+        if self.active.is_none() {
+            Box::pin(self.ensure_active(row, raw_names)).await?;
+        }
 
         let Self {
             database,
             table,
             active,
+            #[cfg(feature = "tcp")]
+            timeouts,
             ..
         } = self;
         let Some(Active { columns, sink, .. }) = active.as_mut() else {
@@ -445,7 +534,14 @@ impl DynamicInsert {
             } => {
                 block.push(&dynamic_row)?;
                 if block.is_full(TcpClient::DEFAULT_INSERT_BLOCK_ROWS) {
-                    send_block(session, native, block, &full_name(database, table)).await?;
+                    send_block(
+                        session,
+                        native,
+                        block,
+                        &full_name(database, table),
+                        timeouts.send,
+                    )
+                    .await?;
                 }
             }
         }
@@ -487,8 +583,10 @@ impl DynamicInsert {
                 native,
                 mut block,
                 ..
-            } => match send_block(&session, &native, &mut block, &full).await {
-                Ok(()) => session.finish().await.map_err(|e| classify_error(&full, e)),
+            } => match send_block(&session, &native, &mut block, &full, self.timeouts.send).await {
+                Ok(()) => within(self.timeouts.end, session.finish())
+                    .await
+                    .map_err(|e| classify_error(&full, e)),
                 Err(e) => {
                     session.abort();
                     Err(e)
@@ -500,14 +598,17 @@ impl DynamicInsert {
     /// Pass `outcome` through, invalidating the cached schema when the server
     /// rejected the rows as drift from it.
     fn after(&mut self, outcome: Result<(), DynamicError>) -> Result<(), DynamicError> {
-        if let Err(DynamicError::SchemaMismatch { .. }) = &outcome {
+        if self.refresh == SchemaRefresh::OnMismatch
+            && let Err(DynamicError::SchemaMismatch { .. }) = &outcome
+        {
             self.invalidate_schema();
         }
         outcome
     }
 
     /// Invalidate the cached schema, forcing a re-fetch on the next insert.
-    /// A no-op on the TCP path, where the caller owns the schema.
+    /// Over TCP this insert keeps the schema it was opened with, and drops the
+    /// entry in the cache [`Self::with_schema_cache`] named, if one.
     pub fn invalidate_schema(&mut self) {
         let full = self.full_table();
         match &self.backend {
@@ -516,7 +617,11 @@ impl DynamicInsert {
                 self.schema = None;
             }
             #[cfg(feature = "tcp")]
-            Backend::Tcp(_) => {}
+            Backend::Tcp { cache, .. } => {
+                if let Some(cache) = cache {
+                    cache.invalidate(&full);
+                }
+            }
         }
     }
 
@@ -526,10 +631,12 @@ impl DynamicInsert {
         self.rows_written
     }
 
-    /// The resolved schema, if it has been loaded.
+    /// The resolved schema the rows are encoded against, if it has been
+    /// loaded. Shared, so a caller can keep it past [`Self::end`] and compare
+    /// it with the table as it stands after a rejection.
     #[must_use]
-    pub fn schema(&self) -> Option<&DynamicSchema> {
-        self.schema.as_deref()
+    pub fn schema(&self) -> Option<&Arc<DynamicSchema>> {
+        self.schema.as_ref()
     }
 }
 
@@ -554,13 +661,15 @@ async fn send_chunk(
         .map_err(|e| classify_error(full_table, e))
 }
 
-/// Transpose the buffered RowBinary rows into one Native block and send it.
+/// Transpose the buffered RowBinary rows into one Native block and send it,
+/// within `bound`.
 #[cfg(feature = "tcp")]
 async fn send_block(
     session: &TcpInsertSession,
     native: &[ColumnSchema],
     block: &mut RowBlock,
     full_table: &str,
+    bound: Option<Duration>,
 ) -> Result<(), DynamicError> {
     if block.is_empty() {
         return Ok(());
@@ -569,8 +678,7 @@ async fn send_block(
         .map_err(|e| classify_error(full_table, e))?;
     let rows = block.rows.len() as u64;
     block.recycle();
-    session
-        .send_block(bytes, native.len() as u64, rows)
+    within(bound, session.send_block(bytes, native.len() as u64, rows))
         .await
         .map_err(|e| classify_error(full_table, e))
 }
@@ -981,6 +1089,87 @@ mod tests {
             assert!(matches!(err, DynamicError::Transport { .. }), "got {err:?}");
             assert!(err.is_retriable());
             let _sock = server.await.unwrap();
+        }
+
+        /// The insert's own bounds end each step against a server that opens
+        /// the INSERT and then goes quiet, with no read timeout on the client:
+        /// `send` on opening it, `end` on the server's final answer.
+        #[tokio::test]
+        async fn the_insert_timeouts_bound_a_server_that_goes_quiet() {
+            let (_, row) = rows();
+            for open_answers in [false, true] {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap().to_string();
+                let server = tokio::spawn(async move {
+                    let (mut sock, _) = listener.accept().await.unwrap();
+                    serve_one_handshake(&mut sock).await;
+                    if open_answers {
+                        let mut buf = [0u8; 4096];
+                        let _ = sock.read(&mut buf).await;
+                        write_schema_block(&mut sock, &[("n", "UInt64"), ("_json", "String")])
+                            .await;
+                    }
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    sock
+                });
+                let (schema, _) = rows();
+                let bound = Some(Duration::from_millis(250));
+                let mut insert = DynamicInsert::tcp(TcpClient::new(addr), "db", "t", schema)
+                    .with_timeouts(InsertTimeouts::new(bound, bound));
+                let err = match insert.write_map(&row).await {
+                    Err(e) => e,
+                    Ok(()) => insert.end().await.expect_err("the server never commits"),
+                };
+                assert!(err.is_timed_out(), "open answers {open_answers}: {err:?}");
+                assert!(err.is_retriable());
+                server.abort();
+            }
+        }
+    }
+
+    /// A TCP insert opened from a cached schema drops that cache entry on a
+    /// mismatch, so the retry reads the table again rather than the stale
+    /// schema until its TTL.
+    #[cfg(feature = "unified")]
+    #[tokio::test]
+    async fn a_tcp_mismatch_drops_the_cached_schema_it_opened_from() {
+        let cache = DynamicSchemaCache::new(std::time::Duration::from_secs(300));
+        cache.insert("db.t", Arc::new(schema()));
+        // A cache hit, so nothing is read from this address.
+        let client = crate::unified::UnifiedClient::Tcp(TcpClient::new("127.0.0.1:9"));
+        let mut insert = client
+            .dynamic_insert("db", "t", Arc::clone(&cache))
+            .await
+            .expect("opens from the cache");
+        let mismatch = Err(DynamicError::SchemaMismatch {
+            table: "db.t".into(),
+            message: "drift".into(),
+        });
+        assert!(insert.after(mismatch).is_err());
+        assert!(
+            cache.get("db.t").is_none(),
+            "the stale schema is still cached"
+        );
+    }
+
+    /// A schema mismatch drops the cached schema by default, and keeps it with
+    /// [`SchemaRefresh::AtExpiry`].
+    #[test]
+    fn a_mismatch_refreshes_the_cache_only_when_asked_to() {
+        for (refresh, kept) in [
+            (SchemaRefresh::OnMismatch, false),
+            (SchemaRefresh::AtExpiry, true),
+        ] {
+            let cache = DynamicSchemaCache::new(std::time::Duration::from_secs(300));
+            cache.insert("db.t", Arc::new(schema()));
+            let mut insert = DynamicInsert::http(Client::default(), "db", "t", Arc::clone(&cache))
+                .with_schema_refresh(refresh);
+            let mismatch = Err(DynamicError::SchemaMismatch {
+                table: "db.t".into(),
+                message: "drift".into(),
+            });
+            assert!(insert.after(mismatch).is_err());
+            assert_eq!(cache.get("db.t").is_some(), kept, "{refresh:?}");
         }
     }
 

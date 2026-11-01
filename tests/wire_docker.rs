@@ -355,6 +355,11 @@ const CASES: &[Case] = &[
         &["[('a', map('k', 1))]", "[]"],
     ),
     case("Point", &["(1.5, -2.5)"]),
+    case("Ring", &["[(1, 2), (3, 4)]", "[]"]),
+    case("LineString", &["[(1, 2), (3, 4)]"]),
+    case("Polygon", &["[[(1, 2), (3, 4), (5, 6)]]", "[]"]),
+    case("MultiLineString", &["[[(1, 2)], [(3, 4)]]"]),
+    case("MultiPolygon", &["[[[(1, 2), (3, 4)]]]", "[]"]),
     case("SimpleAggregateFunction(sum, UInt64)", &["1", "2"]),
     case("JSON", &[r#"'{"a":1,"b":{"c":"x"}}'"#, "'{}'"]),
     case("JSON", &[r#"'{"arr":[1,2,3]}'"#]),
@@ -495,6 +500,7 @@ const VALUE_COLUMNS: &[(&str, &str, &str, &str)] = &[
         "0",
     ),
     ("f64", "Float64", "-1.5", "3.25"),
+    ("bf16", "BFloat16", "1.5", "-2"),
     ("b", "Bool", "true", "false"),
     ("s", "String", "''", "concat('a', char(0), 'b')"),
     ("d", "Date", "'1970-01-01'", "'2149-06-06'"),
@@ -573,6 +579,8 @@ async fn decoded_values_match_what_the_literals_asked_for() {
     assert_eq!(got.get::<i64>("i64").unwrap(), [i64::MIN, i64::MAX]);
     assert_eq!(got.get::<i128>("i128").unwrap(), [i128::MIN, 0]);
     assert_eq!(got.get::<f64>("f64").unwrap(), [-1.5, 3.25]);
+    // BFloat16 is the top half of an f32, widened exactly.
+    assert_eq!(got.get::<f32>("bf16").unwrap(), [1.5, -2.0]);
     assert_eq!(got.get::<bool>("b").unwrap(), [true, false]);
     // A ClickHouse String is bytes, so the NUL survives and UTF-8 is not
     // assumed.
@@ -1707,6 +1715,41 @@ async fn a_multi_block_result_reads_back_whole_and_in_order() {
     assert_eq!(http_ns, ns, "transports disagree");
 }
 
+/// `WITH TOTALS` and `extremes = 1` add rows that are not results. Over TCP
+/// they arrive in their own packets, and the rows a caller reads are the
+/// result rows alone, with the totals and extremes blocks still reachable.
+#[tokio::test]
+async fn totals_and_extremes_are_not_result_rows() {
+    use dfe_clickhouse::native::BlockKind;
+
+    const SQL: &str = "SELECT number % 2 AS k, count() AS c FROM numbers(10) \
+                       GROUP BY k WITH TOTALS ORDER BY k SETTINGS extremes = 1";
+
+    require_docker!();
+    let _one = ONE_SERVER.acquire().await.unwrap();
+    let server = server().await;
+    let read = server.tcp().fetch_columns(SQL).await;
+    server.stop().await;
+    let read = read.unwrap();
+
+    assert_eq!(read.get::<u64>("c").unwrap(), [5, 5]);
+    assert_eq!(read.rows(), 2);
+    let kinds: Vec<BlockKind> = read
+        .blocks()
+        .iter()
+        .filter(|b| b.num_rows > 0)
+        .map(|b| b.kind)
+        .collect();
+    assert!(kinds.contains(&BlockKind::Totals), "{kinds:?}");
+    assert!(kinds.contains(&BlockKind::Extremes), "{kinds:?}");
+    let totals = read
+        .blocks()
+        .iter()
+        .find(|b| b.kind == BlockKind::Totals)
+        .unwrap();
+    assert_eq!(totals.column_as::<u64>("c").unwrap(), [10]);
+}
+
 /// An exception raised part-way through a result set must surface as an
 /// error, not as a short read that looks like success.
 #[tokio::test]
@@ -2035,6 +2078,387 @@ async fn every_dfe_type_round_trips_through_the_dynamic_insert() {
         failures.len(),
         DFE_TYPES.len(),
         failures.join("\n")
+    );
+}
+
+/// One coercion the dynamic insert owes a source value: the column, the rows
+/// as JSON text, how to read the column back as text, and what must land.
+struct Coercion {
+    name: &'static str,
+    /// Column definitions after `n UInt32`.
+    columns: &'static str,
+    /// One JSON object per row, `n` added on write.
+    rows: &'static [&'static str],
+    /// A String expression over the table, read in `n` order.
+    read: &'static str,
+    /// `None`: every row must be refused as a bad value, never retried.
+    lands: Option<&'static [&'static str]>,
+}
+
+const fn lands(
+    name: &'static str,
+    columns: &'static str,
+    rows: &'static [&'static str],
+    read: &'static str,
+    want: &'static [&'static str],
+) -> Coercion {
+    Coercion {
+        name,
+        columns,
+        rows,
+        read,
+        lands: Some(want),
+    }
+}
+
+const fn refuses(
+    name: &'static str,
+    columns: &'static str,
+    row: &'static [&'static str],
+) -> Coercion {
+    Coercion {
+        name,
+        columns,
+        rows: row,
+        read: "''",
+        lands: None,
+    }
+}
+
+const COERCIONS: &[Coercion] = &[
+    lands(
+        "a defaulted column the first row omits",
+        "a UInt32 DEFAULT 7, b String DEFAULT 'd'",
+        &[r"{}", r#"{"a": 5, "b": "x"}"#],
+        "concat(toString(a), '/', b)",
+        &["7/d", "5/x"],
+    ),
+    refuses("UInt8 past its width", "v UInt8", &[r#"{"v": 256}"#]),
+    refuses("Int8 past its width", "v Int8", &[r#"{"v": 200}"#]),
+    refuses("a negative UInt32", "v UInt32", &[r#"{"v": -1}"#]),
+    refuses("UInt64 from 1e30", "v UInt64", &[r#"{"v": 1e30}"#]),
+    lands(
+        "Decimal text past 2^53",
+        "v Decimal(38, 0)",
+        &[r#"{"v": "9007199254740993"}"#],
+        "toString(v)",
+        &["9007199254740993"],
+    ),
+    lands(
+        "Decimal number past 2^53",
+        "v Decimal(38, 0)",
+        &[r#"{"v": 9007199254740993}"#],
+        "toString(v)",
+        &["9007199254740993"],
+    ),
+    lands(
+        "Decimal(38, 10) with 29 digits",
+        "v Decimal(38, 10)",
+        &[r#"{"v": "1234567890123456789.0123456789"}"#],
+        "toString(v)",
+        &["1234567890123456789.0123456789"],
+    ),
+    lands(
+        "Decimal exponent text, exact",
+        "v Decimal(38, 0)",
+        &[r#"{"v": "1.2345678901234567891e19"}"#],
+        "toString(v)",
+        &["12345678901234567891"],
+    ),
+    lands(
+        "Decimal negative exponent text",
+        "v Decimal(18, 4)",
+        &[r#"{"v": "-1.2345e-2"}"#],
+        "toString(v)",
+        &["-0.0123"],
+    ),
+    refuses(
+        "Decimal(9, 2) past Int32",
+        "v Decimal(9, 2)",
+        &[r#"{"v": "99999999.99"}"#],
+    ),
+    lands(
+        "DateTime64 at +10:00",
+        "v DateTime64(3, 'UTC')",
+        &[r#"{"v": "2026-09-26T20:00:00+10:00"}"#],
+        "toString(v)",
+        &["2026-09-26 10:00:00.000"],
+    ),
+    lands(
+        "DateTime64 at -05:30 with a fraction",
+        "v DateTime64(3, 'UTC')",
+        &[r#"{"v": "2026-09-26T04:30:00.250-05:30"}"#],
+        "toString(v)",
+        &["2026-09-26 10:00:00.250"],
+    ),
+    lands(
+        "DateTime64(6) from epoch milliseconds",
+        "v DateTime64(6, 'UTC')",
+        &[r#"{"v": 1790416800123}"#],
+        "toString(v)",
+        &["2026-09-26 10:00:00.123000"],
+    ),
+    lands(
+        "DateTime64(3) from epoch seconds",
+        "v DateTime64(3, 'UTC')",
+        &[r#"{"v": 1790416800}"#],
+        "toString(v)",
+        &["2026-09-26 10:00:00.000"],
+    ),
+    lands(
+        "DateTime64(9) from epoch microseconds as text",
+        "v DateTime64(9, 'UTC')",
+        &[r#"{"v": "1790416800123456"}"#],
+        "toString(v)",
+        &["2026-09-26 10:00:00.123456000"],
+    ),
+    lands(
+        "DateTime64(3) from epoch milliseconds, unchanged",
+        "v DateTime64(3, 'UTC')",
+        &[r#"{"v": 1790416800123}"#],
+        "toString(v)",
+        &["2026-09-26 10:00:00.123"],
+    ),
+    lands(
+        "DateTime at +10:00",
+        "v DateTime('UTC')",
+        &[r#"{"v": "2026-09-26T20:00:00+10:00"}"#],
+        "toString(v)",
+        &["2026-09-26 10:00:00"],
+    ),
+    lands(
+        "IPv6 from IPv4 text",
+        "v IPv6",
+        &[r#"{"v": "10.0.0.1"}"#],
+        "toString(v)",
+        &["::ffff:10.0.0.1"],
+    ),
+    lands(
+        "JSON root array",
+        "v JSON",
+        &[r#"{"v": ["a", "b"]}"#],
+        "toString(v)",
+        &[r#"{"list":["a","b"]}"#],
+    ),
+    lands(
+        "JSON root array as text",
+        "v JSON",
+        &[r#"{"v": "[\"a\"]"}"#],
+        "toString(v)",
+        &[r#"{"list":["a"]}"#],
+    ),
+    lands(
+        "JSON object as text",
+        "v JSON",
+        &[r#"{"v": "{\"a\": 1}"}"#],
+        "toString(v)",
+        &[r#"{"a":1}"#],
+    ),
+    lands(
+        "JSON scalar",
+        "v JSON",
+        &[r#"{"v": 42}"#],
+        "toString(v)",
+        &[r#"{"value":42}"#],
+    ),
+    lands(
+        "JSON text that is not JSON",
+        "v JSON",
+        &[r#"{"v": "not json"}"#],
+        "toString(v)",
+        &[r#"{"value":"not json"}"#],
+    ),
+    lands(
+        "Point as 'lat,lon'",
+        "v Point",
+        &[r#"{"v": "41.12,-71.34"}"#],
+        "toString(v)",
+        &["(-71.34,41.12)"],
+    ),
+    lands(
+        "Point as WKT",
+        "v Point",
+        &[r#"{"v": "POINT (-71.34 41.12)"}"#],
+        "toString(v)",
+        &["(-71.34,41.12)"],
+    ),
+    lands(
+        "Point as GeoJSON",
+        "v Point",
+        &[r#"{"v": {"type": "Point", "coordinates": [-71.34, 41.12]}}"#],
+        "toString(v)",
+        &["(-71.34,41.12)"],
+    ),
+    refuses(
+        "Point at latitude 100",
+        "v Point",
+        &[r#"{"v": {"lat": 100, "lon": 0}}"#],
+    ),
+    refuses("Point at longitude 200", "v Point", &[r#"{"v": [200, 0]}"#]),
+    lands(
+        "Ring",
+        "v Ring",
+        &[r#"{"v": [[1, 2], [3, 4]]}"#],
+        "toString(v)",
+        &["[(1,2),(3,4)]"],
+    ),
+    lands(
+        "LineString",
+        "v LineString",
+        &[r#"{"v": [[1, 2], [3, 4]]}"#],
+        "toString(v)",
+        &["[(1,2),(3,4)]"],
+    ),
+    lands(
+        "Polygon",
+        "v Polygon",
+        &[r#"{"v": [[[1, 2], [3, 4], [5, 6]]]}"#],
+        "toString(v)",
+        &["[[(1,2),(3,4),(5,6)]]"],
+    ),
+    lands(
+        "MultiPolygon",
+        "v MultiPolygon",
+        &[r#"{"v": [[[[1, 2], [3, 4]]]]}"#],
+        "toString(v)",
+        &["[[[(1,2),(3,4)]]]"],
+    ),
+    lands(
+        "Array given one value",
+        "v Array(String)",
+        &[r#"{"v": "one"}"#],
+        "toString(v)",
+        &["['one']"],
+    ),
+    lands(
+        "Array(UInt32) given one value",
+        "v Array(UInt32)",
+        &[r#"{"v": 5}"#],
+        "toString(v)",
+        &["[5]"],
+    ),
+    lands(
+        "Array(Point) given one point",
+        "v Array(Point)",
+        &[r#"{"v": [1.5, 2.5]}"#],
+        "toString(v)",
+        &["[(1.5,2.5)]"],
+    ),
+    refuses(
+        "Enum8 given an undeclared number",
+        "v Enum8('a' = 1, 'b' = 2)",
+        &[r#"{"v": 5}"#],
+    ),
+    refuses(
+        "Enum8 given an undeclared numeric string",
+        "v Enum8('a' = 1, 'b' = 2)",
+        &[r#"{"v": "3"}"#],
+    ),
+    lands(
+        "Nullable Enum8 by name",
+        "v Nullable(Enum8('on' = 1, 'off' = 2))",
+        &[r#"{"v": "off"}"#],
+        "ifNull(toString(v), 'NULL')",
+        &["off"],
+    ),
+    lands(
+        "SimpleAggregateFunction(sum, UInt64)",
+        "v SimpleAggregateFunction(sum, UInt64)",
+        &[r#"{"v": 5}"#],
+        "toString(v)",
+        &["5"],
+    ),
+    lands(
+        "SimpleAggregateFunction over an Array",
+        "v SimpleAggregateFunction(groupArrayArray, Array(String))",
+        &[r#"{"v": ["a", "b"]}"#],
+        "toString(v)",
+        &["['a','b']"],
+    ),
+    lands(
+        "Enum16 by number",
+        "v Enum16('x' = 1000, 'y' = 2000)",
+        &[r#"{"v": 2000}"#],
+        "toString(v)",
+        &["y"],
+    ),
+];
+
+/// Insert one coercion case on `client`, then read it back on `reader`.
+async fn coercion_outcome(
+    client: &UnifiedClient,
+    reader: &UnifiedClient,
+    case: &Coercion,
+    table: &str,
+) -> Result<Vec<String>, dfe_clickhouse::dynamic::DynamicError> {
+    use dfe_clickhouse::dynamic::DynamicSchemaCache;
+    use serde_json::{Map, Value};
+
+    let cache = DynamicSchemaCache::new(Duration::from_secs(60));
+    let mut insert = match client.dynamic_insert("wire", table, cache).await {
+        Ok(insert) => insert,
+        Err(dfe_clickhouse::Error::Dynamic(e)) => return Err(e),
+        Err(e) => panic!("{}: opening the insert failed: {e}", case.name),
+    };
+    for (n, row) in (0u32..).zip(case.rows) {
+        let mut row: Map<String, Value> = serde_json::from_str(row).expect("case rows are JSON");
+        row.insert("n".to_string(), Value::from(n));
+        insert.write_map(&row).await?;
+    }
+    insert.end().await?;
+    let sql = format!(
+        "SELECT CAST({} AS String) AS s FROM wire.{table} ORDER BY n",
+        case.read
+    );
+    Ok(reader
+        .fetch_columns(&sql)
+        .await
+        .and_then(|c| c.get::<String>("s"))
+        .unwrap_or_else(|e| panic!("{}: reading back failed: {e}", case.name)))
+}
+
+/// Every coercion lands as the value the source meant, or is refused as a bad
+/// value, on both transports. A refusal must not be retriable: a caller
+/// retrying a row the encoder will never accept holds it for good.
+#[tokio::test]
+async fn every_coercion_lands_or_is_refused_on_both_transports() {
+    require_docker!();
+    let _one = ONE_SERVER.acquire().await.unwrap();
+    let server = server().await;
+    let (tcp, http) = (server.tcp(), server.http());
+    tcp.execute("CREATE DATABASE IF NOT EXISTS wire")
+        .await
+        .unwrap();
+
+    let mut wrong = Vec::new();
+    for (i, case) in COERCIONS.iter().enumerate() {
+        for (name, client) in [("http", &http), ("tcp", &tcp)] {
+            let table = format!("coerce_{name}_{i}");
+            tcp.execute(&format!(
+                "CREATE OR REPLACE TABLE wire.{table} (n UInt32, {}) ENGINE = MergeTree ORDER BY n",
+                case.columns
+            ))
+            .await
+            .unwrap();
+            let outcome = coercion_outcome(client, &tcp, case, &table).await;
+            let right = match (&case.lands, &outcome) {
+                (None, Err(e)) => !e.is_retriable(),
+                (Some(want), Ok(got)) => got.iter().map(String::as_str).eq(want.iter().copied()),
+                _ => false,
+            };
+            if !right {
+                wrong.push(format!("WRONG {} over {name}: {outcome:?}", case.name));
+            }
+        }
+    }
+
+    server.stop().await;
+    assert!(
+        wrong.is_empty(),
+        "{} of {} cases WRONG:\n{}",
+        wrong.len(),
+        COERCIONS.len() * 2,
+        wrong.join("\n")
     );
 }
 

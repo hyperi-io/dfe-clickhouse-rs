@@ -6,10 +6,10 @@
 //! value buffers the cursor can index row by row without a second transpose.
 //! `Variant`, `Dynamic` and `JSON` columns arrive as
 //! [`DecodedColumn::Json`], one document per row, rendered by
-//! [`crate::native::columns::read_column`]. `BFloat16`, `Time`, `Time64` and
-//! the geo types have no typed variant yet: their wire bytes are consumed so
-//! the stream pointer stays aligned and the column is tagged
-//! [`DecodedColumn::Unsupported`].
+//! [`crate::native::columns::read_column`]. A `Point` arrives as the
+//! `Tuple(Float64, Float64)` it is on the wire (the geo shapes as arrays of
+//! it), `BFloat16` widened to `Float32`, `Time` as `Int32` seconds and
+//! `Time64` as `Int64` ticks at the column's precision.
 //!
 //! [`NativeReader.cpp`]: https://github.com/ClickHouse/ClickHouse/blob/master/src/Formats/NativeReader.cpp
 
@@ -32,6 +32,11 @@ const MAX_BLOCK_ROWS: u64 = 1 << 28;
 
 /// Hard cap on the `num_columns` a Data packet header may declare.
 const MAX_BLOCK_COLUMNS: u64 = 1 << 16;
+
+/// Bytes a block's sparse columns may expand to, summed over them. A dense
+/// column is backed byte for byte by the wire, but a sparse one's defaults are
+/// not: a few bytes can declare 2^28 rows of `UInt256`, an 8 GiB zero fill.
+pub(crate) const MAX_SPARSE_EXPANSION_BYTES: usize = 1 << 30;
 
 /// Reject a length a server declared but cannot back with payload.
 fn refused(what: &str, got: u64, cap: u64) -> Error {
@@ -254,11 +259,6 @@ pub enum DecodedColumn {
         /// Flat value column indexed by `offsets`.
         values: Box<DecodedColumn>,
     },
-
-    /// Type recognised by the parser but not decoded by v1. The wire
-    /// bytes have been consumed (so the stream pointer is correct);
-    /// per-row access on this variant returns an error.
-    Unsupported(String),
 }
 
 impl DecodedColumn {
@@ -304,9 +304,6 @@ impl DecodedColumn {
             Self::LowCardinality { indices, .. } => indices.row_count(),
             Self::Tuple(fields) => fields.first().map_or(0, Self::row_count),
             Self::Map { offsets, .. } => offsets.len(),
-            // Unsupported columns surface as zero rows so callers that
-            // ignore the variant don't loop over uninitialised state.
-            Self::Unsupported(_) => 0,
         }
     }
 
@@ -324,7 +321,12 @@ impl DecodedColumn {
     ///
     /// [`Error::BadResponse`] if a position is past `num_rows`, if the value
     /// count does not match the position count, or for a composite column.
-    pub(crate) fn expand_sparse(self, positions: &[usize], num_rows: usize) -> Result<Self> {
+    pub(crate) fn expand_sparse(
+        self,
+        positions: &[usize],
+        num_rows: usize,
+        budget: &mut usize,
+    ) -> Result<Self> {
         if self.row_count() != positions.len() {
             return Err(Error::BadResponse(format!(
                 "native: sparse column has {} values for {} positions",
@@ -340,7 +342,9 @@ impl DecodedColumn {
 
         macro_rules! scatter {
             ($variant:ident, $values:expr, $default:expr) => {
-                Self::$variant(scatter_values($values, positions, num_rows, $default)?)
+                Self::$variant(scatter_values(
+                    $values, positions, num_rows, $default, budget,
+                )?)
             };
         }
 
@@ -374,7 +378,7 @@ impl DecodedColumn {
             } => Self::Decimal32 {
                 precision,
                 scale,
-                values: scatter_values(values, positions, num_rows, 0i32)?,
+                values: scatter_values(values, positions, num_rows, 0i32, budget)?,
             },
             Self::Decimal64 {
                 precision,
@@ -383,7 +387,7 @@ impl DecodedColumn {
             } => Self::Decimal64 {
                 precision,
                 scale,
-                values: scatter_values(values, positions, num_rows, 0i64)?,
+                values: scatter_values(values, positions, num_rows, 0i64, budget)?,
             },
             Self::Decimal128 {
                 precision,
@@ -392,7 +396,7 @@ impl DecodedColumn {
             } => Self::Decimal128 {
                 precision,
                 scale,
-                values: scatter_values(values, positions, num_rows, 0i128)?,
+                values: scatter_values(values, positions, num_rows, 0i128, budget)?,
             },
             Self::Decimal256 {
                 precision,
@@ -401,7 +405,7 @@ impl DecodedColumn {
             } => Self::Decimal256 {
                 precision,
                 scale,
-                values: scatter_values(values, positions, num_rows, [0u8; 32])?,
+                values: scatter_values(values, positions, num_rows, [0u8; 32], budget)?,
             },
             Self::DateTime64 {
                 precision,
@@ -410,7 +414,7 @@ impl DecodedColumn {
             } => Self::DateTime64 {
                 precision,
                 timezone,
-                values: scatter_values(values, positions, num_rows, 0i64)?,
+                values: scatter_values(values, positions, num_rows, 0i64, budget)?,
             },
             Self::FixedString { width, bytes } => {
                 // Both factors are wire-derived, so the product is checked --
@@ -420,6 +424,7 @@ impl DecodedColumn {
                         "native: sparse FixedString byte length overflows usize".into(),
                     )
                 })?;
+                spend_sparse_budget(budget, total)?;
                 let mut out = with_cap(total)?;
                 out.resize(total, 0u8);
                 for (i, &row) in positions.iter().enumerate() {
@@ -444,7 +449,6 @@ impl DecodedColumn {
             Self::LowCardinality { .. } => "a LowCardinality column",
             Self::Tuple(_) => "a Tuple column",
             Self::Map { .. } => "a Map column",
-            Self::Unsupported(_) => "an unsupported column",
             _ => "this column",
         }
     }
@@ -462,7 +466,9 @@ fn scatter_values<T: Clone>(
     positions: &[usize],
     num_rows: usize,
     default: T,
+    budget: &mut usize,
 ) -> Result<Vec<T>> {
+    spend_sparse_budget(budget, num_rows.saturating_mul(std::mem::size_of::<T>()))?;
     // The reservation covers the full length, so `resize` cannot reallocate.
     let mut out = with_cap(num_rows)?;
     out.resize(num_rows, default);
@@ -470,6 +476,17 @@ fn scatter_values<T: Clone>(
         out[row] = value;
     }
     Ok(out)
+}
+
+/// Take `bytes` of sparse expansion from what the block has left, or refuse it.
+fn spend_sparse_budget(budget: &mut usize, bytes: usize) -> Result<()> {
+    *budget = budget.checked_sub(bytes).ok_or_else(|| {
+        Error::BadResponse(format!(
+            "native: sparse columns would expand past the {MAX_SPARSE_EXPANSION_BYTES}-byte \
+             per-block cap"
+        ))
+    })?;
+    Ok(())
 }
 
 /// A decoded Native data block: ordered list of columns plus the
@@ -485,6 +502,23 @@ pub struct DecodedBlock {
     pub schema: Vec<(String, String)>,
     /// Row count the Data packet header declared.
     pub num_rows: u64,
+    /// Which packet carried the block: result rows, or the `WITH TOTALS` or
+    /// `extremes` rows the server adds.
+    pub kind: BlockKind,
+}
+
+/// Which packet a [`DecodedBlock`] arrived in. The three are framed alike on
+/// the wire, and only `Data` carries result rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BlockKind {
+    /// Result rows.
+    #[default]
+    Data,
+    /// The `WITH TOTALS` row.
+    Totals,
+    /// The `extremes = 1` minimum and maximum rows.
+    Extremes,
 }
 
 impl DecodedBlock {
@@ -822,6 +856,7 @@ pub(crate) async fn decode_block<R: ClickHouseRead>(
 
     let mut schema = with_cap(column_count)?;
     let mut columns = with_cap(column_count)?;
+    let mut sparse_budget = MAX_SPARSE_EXPANSION_BYTES;
 
     for _ in 0..num_columns {
         let name = r.read_utf8_string().await?;
@@ -853,7 +888,7 @@ pub(crate) async fn decode_block<R: ClickHouseRead>(
                     let dense = decode_column(r, &ct, present, server_revision, 0, &mut headers)
                         .await
                         .map_err(|e| name_the_column(&name, e))?;
-                    dense.expand_sparse(&positions, rows)?
+                    dense.expand_sparse(&positions, rows, &mut sparse_budget)?
                 } else {
                     decode_column(r, &ct, num_rows, server_revision, 0, &mut headers)
                         .await
@@ -877,6 +912,7 @@ pub(crate) async fn decode_block<R: ClickHouseRead>(
         columns,
         schema,
         num_rows,
+        kind: BlockKind::Data,
     })
 }
 
@@ -986,14 +1022,14 @@ fn empty_column(col_type: &ColumnType) -> DecodedColumn {
         ColumnType::UInt16 => DecodedColumn::UInt16(Vec::new()),
         ColumnType::Int16 | ColumnType::Enum16 => DecodedColumn::Int16(Vec::new()),
         ColumnType::UInt32 => DecodedColumn::UInt32(Vec::new()),
-        ColumnType::Int32 => DecodedColumn::Int32(Vec::new()),
+        ColumnType::Int32 | ColumnType::Time => DecodedColumn::Int32(Vec::new()),
         ColumnType::UInt64 => DecodedColumn::UInt64(Vec::new()),
-        ColumnType::Int64 => DecodedColumn::Int64(Vec::new()),
+        ColumnType::Int64 | ColumnType::Time64 => DecodedColumn::Int64(Vec::new()),
         ColumnType::Int128 => DecodedColumn::Int128(Vec::new()),
         ColumnType::UInt128 => DecodedColumn::UInt128(Vec::new()),
         ColumnType::Int256 => DecodedColumn::Int256(Vec::new()),
         ColumnType::UInt256 => DecodedColumn::UInt256(Vec::new()),
-        ColumnType::Float32 => DecodedColumn::Float32(Vec::new()),
+        ColumnType::Float32 | ColumnType::BFloat16 => DecodedColumn::Float32(Vec::new()),
         ColumnType::Float64 => DecodedColumn::Float64(Vec::new()),
         ColumnType::Decimal32 { precision, scale } => DecodedColumn::Decimal32 {
             precision: *precision,
@@ -1069,7 +1105,10 @@ fn empty_column(col_type: &ColumnType) -> DecodedColumn {
             }
         }
         ColumnType::SimpleAggregateFunction(inner) => empty_column(inner),
-        other => DecodedColumn::Unsupported(format!("{other:?}")),
+        ColumnType::Point => DecodedColumn::Tuple(vec![
+            DecodedColumn::Float64(Vec::new()),
+            DecodedColumn::Float64(Vec::new()),
+        ]),
     }
 }
 
@@ -1150,9 +1189,15 @@ fn decode_column<'a, R: ClickHouseRead + 'a>(
                 Ok(DecodedColumn::Int16(read_le_column::<_, i16>(r, n).await?))
             }
             ColumnType::UInt32 => Ok(DecodedColumn::UInt32(read_le_column::<_, u32>(r, n).await?)),
-            ColumnType::Int32 => Ok(DecodedColumn::Int32(read_le_column::<_, i32>(r, n).await?)),
+            // `Time` is signed seconds on the wire.
+            ColumnType::Int32 | ColumnType::Time => {
+                Ok(DecodedColumn::Int32(read_le_column::<_, i32>(r, n).await?))
+            }
             ColumnType::UInt64 => Ok(DecodedColumn::UInt64(read_le_column::<_, u64>(r, n).await?)),
-            ColumnType::Int64 => Ok(DecodedColumn::Int64(read_le_column::<_, i64>(r, n).await?)),
+            // `Time64` is signed ticks at the column's precision.
+            ColumnType::Int64 | ColumnType::Time64 => {
+                Ok(DecodedColumn::Int64(read_le_column::<_, i64>(r, n).await?))
+            }
             ColumnType::Int128 => Ok(DecodedColumn::Int128(
                 read_le_column::<_, i128>(r, n).await?,
             )),
@@ -1355,14 +1400,23 @@ fn decode_column<'a, R: ClickHouseRead + 'a>(
                 let cells = columns::read_dynamic_v1v2_body(r, n, &header, depth + 1).await?;
                 Ok(DecodedColumn::Json(unwrap_json_cells(cells)?))
             }
-            // BFloat16, Time, Time64 and Point have no typed variant yet; the
-            // wire bytes are still consumed so the stream pointer stays
-            // aligned, and per-row access on `Unsupported` errors instead of
-            // returning a placeholder.
-            other => {
-                let _consumed = columns::read_column_data(r, other, num_rows).await?;
-                Ok(DecodedColumn::Unsupported(format!("{other:?}")))
+            // `Tuple(Float64, Float64)` on the wire: every x, then every y.
+            ColumnType::Point => {
+                let x = read_le_column::<_, f64>(r, n).await?;
+                let y = read_le_column::<_, f64>(r, n).await?;
+                Ok(DecodedColumn::Tuple(vec![
+                    DecodedColumn::Float64(x),
+                    DecodedColumn::Float64(y),
+                ]))
             }
+            // The top 16 bits of an f32, so widening is exact.
+            ColumnType::BFloat16 => Ok(DecodedColumn::Float32(
+                read_le_column::<_, u16>(r, n)
+                    .await?
+                    .into_iter()
+                    .map(|bits| f32::from_bits(u32::from(bits) << 16))
+                    .collect(),
+            )),
         }
     })
 }
@@ -1955,7 +2009,7 @@ mod tests {
     #[test]
     fn sparse_expansion_refuses_a_value_count_that_does_not_match() {
         let err = DecodedColumn::UInt8(vec![1, 2, 3])
-            .expand_sparse(&[0, 2], 4)
+            .expand_sparse(&[0, 2], 4, &mut MAX_SPARSE_EXPANSION_BYTES.clone())
             .unwrap_err();
         match err {
             Error::BadResponse(msg) => {
@@ -1970,7 +2024,7 @@ mod tests {
     #[test]
     fn sparse_expansion_refuses_a_position_past_the_block() {
         let err = DecodedColumn::UInt8(vec![7])
-            .expand_sparse(&[9], 4)
+            .expand_sparse(&[9], 4, &mut MAX_SPARSE_EXPANSION_BYTES.clone())
             .unwrap_err();
         match err {
             Error::BadResponse(msg) => {
@@ -1986,12 +2040,44 @@ mod tests {
     #[test]
     fn sparse_expansion_refuses_a_row_count_the_allocator_cannot_back() {
         let err = DecodedColumn::UInt64(vec![7])
-            .expand_sparse(&[0], usize::MAX / 4)
+            .expand_sparse(&[0], usize::MAX / 4, &mut usize::MAX.clone())
             .unwrap_err();
         match err {
             Error::BadResponse(msg) => assert!(msg.contains("column buffer"), "got: {msg}"),
             other => panic!("expected BadResponse, got {other:?}"),
         }
+    }
+
+    /// A sparse column's defaults are not backed by the wire, so a block's
+    /// expansion is capped across its columns: one 2^28-row `UInt256`
+    /// declaration would be an 8 GiB zero fill, and columns that fit alone
+    /// still share the cap.
+    #[test]
+    fn sparse_expansion_stops_at_the_per_block_budget() {
+        let mut budget = MAX_SPARSE_EXPANSION_BYTES;
+        let err = DecodedColumn::UInt256(Vec::new())
+            .expand_sparse(&[], 1 << 28, &mut budget)
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::BadResponse(m) if m.contains("per-block cap")),
+            "{err:?}"
+        );
+
+        // A small cap, so the shared spend shows without a large fill.
+        let mut budget = 1_024;
+        let rows = 64;
+        for _ in 0..2 {
+            DecodedColumn::UInt64(Vec::new())
+                .expand_sparse(&[], rows, &mut budget)
+                .expect("each half fits");
+        }
+        assert_eq!(budget, 0);
+        assert!(
+            DecodedColumn::UInt8(Vec::new())
+                .expand_sparse(&[], 1, &mut budget)
+                .is_err(),
+            "the third column finds the cap spent"
+        );
     }
 
     /// `num_rows` and `FixedString`'s width are both wire-derived, and the
@@ -2003,7 +2089,7 @@ mod tests {
             width: usize::MAX / 2 + 1,
             bytes: Vec::new(),
         }
-        .expand_sparse(&[], 2)
+        .expand_sparse(&[], 2, &mut usize::MAX.clone())
         .unwrap_err();
         match err {
             Error::BadResponse(msg) => assert!(msg.contains("overflows usize"), "got: {msg}"),
@@ -2190,6 +2276,60 @@ mod tests {
         let mut cur = Cursor::new(buf);
         let mut block = decode_block(&mut cur, 1, num_rows, REV).await.unwrap();
         block.columns.pop().unwrap()
+    }
+
+    /// `(type, rows, payload, what must decode)`: each reads to values a
+    /// caller can use, never a column that holds none.
+    #[tokio::test]
+    async fn bfloat16_time_time64_and_point_decode_to_values() {
+        let mut point = Vec::new();
+        for f in [1.5f64, -3.0, 2.5, 4.0] {
+            point.extend_from_slice(&f.to_le_bytes());
+        }
+        // 1.5 is 0x3FC0 in BFloat16, the top half of its f32 bits.
+        let bf16 = [0x3FC0u16, 0xC040]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<u8>>();
+        let time = [3_600i32, -1]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<u8>>();
+        let time64 = [1_500i64]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<u8>>();
+
+        match decode_one_typed("Point", 2, &point).await {
+            DecodedColumn::Tuple(fields) => match fields.as_slice() {
+                [DecodedColumn::Float64(x), DecodedColumn::Float64(y)] => {
+                    assert_eq!(x, &[1.5, -3.0]);
+                    assert_eq!(y, &[2.5, 4.0]);
+                }
+                other => panic!("Point fields: {other:?}"),
+            },
+            other => panic!("Point: {other:?}"),
+        }
+        match decode_one_typed("BFloat16", 2, &bf16).await {
+            DecodedColumn::Float32(v) => assert_eq!(v, [1.5, -3.0]),
+            other => panic!("BFloat16: {other:?}"),
+        }
+        match decode_one_typed("Time", 2, &time).await {
+            DecodedColumn::Int32(v) => assert_eq!(v, [3_600, -1]),
+            other => panic!("Time: {other:?}"),
+        }
+        match decode_one_typed("Time64(3)", 1, &time64).await {
+            DecodedColumn::Int64(v) => assert_eq!(v, [1_500]),
+            other => panic!("Time64: {other:?}"),
+        }
+        let ring = [2u64.to_le_bytes().to_vec(), point].concat();
+        match decode_one_typed("Ring", 1, &ring).await {
+            DecodedColumn::Array { offsets, child } => {
+                assert_eq!(offsets, [2]);
+                assert!(matches!(*child, DecodedColumn::Tuple(_)), "{child:?}");
+            }
+            other => panic!("Ring: {other:?}"),
+        }
     }
 
     fn le_bytes_i128(vals: &[i128]) -> Vec<u8> {
@@ -2530,6 +2670,7 @@ mod tests {
             columns: vec![column],
             schema: vec![("c".to_string(), type_name.to_string())],
             num_rows,
+            kind: BlockKind::Data,
         }
     }
 
@@ -2865,6 +3006,7 @@ mod tests {
             columns: Vec::new(),
             schema: vec![("c".to_string(), "UInt64".to_string())],
             num_rows: 0,
+            kind: BlockKind::Data,
         };
         assert!(block.column("c").is_none());
         assert_eq!(block.column_as::<u64>("c").unwrap(), [] as [u64; 0]);
@@ -2879,6 +3021,7 @@ mod tests {
             columns: Vec::new(),
             schema: Vec::new(),
             num_rows: 0,
+            kind: BlockKind::Data,
         };
         assert_eq!(block.column_as::<u64>("c").unwrap(), [] as [u64; 0]);
     }
@@ -3153,8 +3296,7 @@ mod tests {
 
     /// Assert what a successful decode must satisfy: one column per schema
     /// entry, and every column exactly `rows` long. A decoder that fabricated
-    /// rows the wire never backed would fail the second. `Unsupported` is
-    /// exempt because it deliberately reports zero rows (`:314-316`).
+    /// rows the wire never backed would fail the second.
     fn assert_block_is_consistent(
         block: &DecodedBlock,
         rows: u64,
@@ -3162,9 +3304,6 @@ mod tests {
         use proptest::prelude::*;
         prop_assert_eq!(block.schema.len(), block.columns.len());
         for column in &block.columns {
-            if matches!(column, DecodedColumn::Unsupported(_)) {
-                continue;
-            }
             let got = u64::try_from(column.row_count()).expect("row count fits u64");
             prop_assert_eq!(got, rows);
         }

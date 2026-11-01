@@ -17,17 +17,25 @@
 //! protocol (`FORMAT Native` through `TcpClient`). Both sinks share the
 //! per-column encoder behind [`DynamicRow::encode_into`].
 //!
-//! The five modules below were ported from the DFE Loader and relicensed
-//! Apache-2.0 to match the crate.
+//! These modules were ported from the DFE Loader and relicensed Apache-2.0 to
+//! match the crate.
 
+mod datetime;
 pub mod encode;
 pub mod error;
 pub mod insert;
 pub mod parsed_type;
 pub mod schema;
+mod shape;
 
-pub use encode::{ColumnDef, DynamicRow, JSON_ARRAY_WRAPPER_KEY};
+pub use encode::{ColumnDef, DynamicRow};
 pub use error::DynamicError;
-pub use insert::DynamicInsert;
+pub use insert::{DynamicInsert, InsertTimeouts, SchemaRefresh};
 pub use parsed_type::{ParsedType, TypeTag};
-pub use schema::{DynamicSchema, DynamicSchemaCache, fetch_dynamic_schema};
+#[cfg(feature = "tcp")]
+pub use schema::fetch_dynamic_schema_tcp;
+pub use schema::{DynamicSchema, DynamicSchemaCache, MAX_CACHED_TABLES, fetch_dynamic_schema};
+pub use shape::{
+    JSON_ARRAY_WRAPPER_KEY, JSON_SCALAR_WRAPPER_KEY, needs_shaping, shape_for_type,
+    shape_json_value, shaping_changes,
+};

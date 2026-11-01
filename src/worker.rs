@@ -249,7 +249,17 @@ async fn run<W: CommandWorker>(
                 // across an `.await` bleeds the caller's span onto
                 // whatever the runtime schedules next on this thread.
                 trace!(target: "clickhouse::worker", worker = name, "handling command");
-                worker.handle(cmd).instrument(caller_span).await;
+                // Shutdown interrupts a command in flight: one waiting on a
+                // silent peer with no deadline would otherwise outlive the
+                // pool that recycled it, socket and all.
+                tokio::select! {
+                    biased;
+                    _ = &mut shutdown_rx => {
+                        debug!(target: "clickhouse::worker", worker = name, "shutdown interrupted a command");
+                        break;
+                    }
+                    () = worker.handle(cmd).instrument(caller_span) => {}
+                }
             }
             Some(NextEvent::Idle) => {
                 trace!(target: "clickhouse::worker", worker = name, "idle tick");
@@ -468,6 +478,42 @@ mod tests {
         assert_send_sync::<WorkerControl<()>>();
         assert_send_sync::<WorkerHandle<()>>();
         assert_send_sync::<SendError<()>>();
+    }
+
+    /// A command that never finishes, as a socket read with no deadline does,
+    /// still gives way to shutdown, and `on_shutdown` still runs: otherwise
+    /// the pool's recycle times out and leaves the worker and its socket
+    /// running.
+    #[tokio::test]
+    async fn shutdown_interrupts_a_command_that_never_finishes() {
+        struct Stuck(Arc<Notify>, Arc<Notify>);
+        impl CommandWorker for Stuck {
+            type Command = ();
+            fn name() -> &'static str {
+                "stuck"
+            }
+            async fn handle(&mut self, (): ()) {
+                self.0.notify_one();
+                std::future::pending::<()>().await;
+            }
+            fn on_shutdown(&mut self) -> impl Future<Output = ()> + Send + '_ {
+                let fired = Arc::clone(&self.1);
+                async move { fired.notify_one() }
+            }
+        }
+
+        let (started, shut) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        let control = spawn(Stuck(Arc::clone(&started), Arc::clone(&shut)), 1);
+        control.handle().send(()).await.unwrap();
+        started.notified().await;
+
+        tokio::time::timeout(Duration::from_secs(2), control.shutdown())
+            .await
+            .expect("shutdown must not wait on the stuck command")
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(10), shut.notified())
+            .await
+            .expect("on_shutdown runs after the interrupted command");
     }
 
     // Paused time: the sleep below completes only once the worker has run.

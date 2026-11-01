@@ -20,7 +20,7 @@ use clickhouse::Client;
 use crate::error::{Error, Result};
 use crate::native::decode::decode_block;
 use crate::native::io::ClickHouseRead;
-use crate::native::{DecodedBlock, FromColumn};
+use crate::native::{BlockKind, DecodedBlock, FromColumn};
 use crate::tcp::TcpClient;
 use crate::tcp::protocol::DBMS_TCP_PROTOCOL_VERSION;
 
@@ -153,8 +153,7 @@ impl UnifiedClient {
         table: &str,
         cache: std::sync::Arc<crate::dynamic::DynamicSchemaCache>,
     ) -> Result<crate::dynamic::DynamicInsert> {
-        use crate::dynamic::DynamicInsert;
-        use crate::dynamic::schema::{schema_from_system_columns, system_columns_sql};
+        use crate::dynamic::{DynamicInsert, fetch_dynamic_schema_tcp};
 
         // Two arms, one of which returns: `if let` would have to name the
         // other arm's binding a second time to reach the TCP client.
@@ -170,20 +169,13 @@ impl UnifiedClient {
         let schema = if let Some(cached) = cache.get(&full) {
             cached
         } else {
-            let columns = self
-                .fetch_columns(&system_columns_sql(database, table))
-                .await?;
-            let rows = columns
-                .get::<String>("name")?
-                .into_iter()
-                .zip(columns.get::<String>("col_type")?)
-                .zip(columns.get::<String>("default_kind")?)
-                .map(|((name, col_type), kind)| (name, col_type, kind));
-            let fetched = schema_from_system_columns(full.clone(), rows)?;
+            // Boxed: a cold read only, and inline it would size every caller's
+            // future to match.
+            let fetched = Box::pin(fetch_dynamic_schema_tcp(client, database, table, None)).await?;
             cache.insert(&full, std::sync::Arc::clone(&fetched));
             fetched
         };
-        Ok(DynamicInsert::tcp(client.clone(), database, table, schema))
+        Ok(DynamicInsert::tcp(client.clone(), database, table, schema).with_schema_cache(cache))
     }
 }
 
@@ -196,7 +188,12 @@ pub struct Columns {
 }
 
 impl Columns {
-    /// Every value of column `name`, in server order, across every block.
+    /// Every value of column `name`, in server order, across every result
+    /// block. `WITH TOTALS` and `extremes` rows are left out, and stay in
+    /// [`Self::blocks`] under their [`BlockKind`].
+    ///
+    /// Over HTTP the Native format frames those rows as ordinary blocks, so
+    /// only the TCP arm can leave them out.
     ///
     /// # Errors
     ///
@@ -204,22 +201,26 @@ impl Columns {
     /// not declare `name`, or if the column does not read as `T`.
     pub fn get<T: FromColumn>(&self, name: &str) -> Result<Vec<T>> {
         let mut values = Vec::with_capacity(self.rows());
-        for block in &self.blocks {
+        for block in self.result_blocks() {
             values.extend(block.column_as::<T>(name)?);
         }
         Ok(values)
     }
 
-    /// Rows across every block; schema-only and empty blocks count nothing.
+    /// Result rows across every block; schema-only and empty blocks count
+    /// nothing, and neither do totals or extremes.
     ///
     /// A block's declared count is saturated into `usize`, which only bites on
     /// a 32-bit target that could not have held the block anyway.
     #[must_use]
     pub fn rows(&self) -> usize {
-        self.blocks
-            .iter()
+        self.result_blocks()
             .map(|b| usize::try_from(b.num_rows).unwrap_or(usize::MAX))
             .sum()
+    }
+
+    fn result_blocks(&self) -> impl Iterator<Item = &DecodedBlock> {
+        self.blocks.iter().filter(|b| b.kind == BlockKind::Data)
     }
 
     /// Whether the result set carries no rows.

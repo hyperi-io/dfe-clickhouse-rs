@@ -359,8 +359,16 @@ impl ColumnType {
             "Dynamic" => Some(Self::Dynamic),
             // Legacy Object('json') -- stored as a plain String on the wire.
             "Object('json')" => Some(Self::Json),
-            // Geo types
+            // Geo types. The shapes are arrays of points on the wire, under
+            // their own names.
             "Point" => Some(Self::Point),
+            "Ring" | "LineString" => Some(Self::Array(Box::new(Self::Point))),
+            "Polygon" | "MultiLineString" => {
+                Some(Self::Array(Box::new(Self::Array(Box::new(Self::Point)))))
+            }
+            "MultiPolygon" => Some(Self::Array(Box::new(Self::Array(Box::new(Self::Array(
+                Box::new(Self::Point),
+            )))))),
             _ => None,
         }
     }
