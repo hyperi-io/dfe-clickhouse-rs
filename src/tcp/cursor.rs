@@ -125,6 +125,7 @@ impl TcpRawCursor {
                         columns: Vec::new(),
                         schema: columns,
                         num_rows,
+                        kind: crate::native::BlockKind::Data,
                     }));
                 }
                 // Progress / ProfileInfo / TableColumns / TimezoneUpdate
@@ -166,6 +167,7 @@ mod tests {
             columns: vec![DecodedColumn::UInt64(vec![1, 2, 3])],
             schema: vec![("n".into(), "UInt64".into())],
             num_rows: 3,
+            kind: crate::native::BlockKind::Data,
         };
         tx.send(Ok(ServerPacket::DataBlock(block))).await.unwrap();
         tx.send(Ok(ServerPacket::EndOfStream)).await.unwrap();

@@ -26,7 +26,7 @@
 use tokio::io::AsyncReadExt;
 
 use crate::error::{Error, Result};
-use crate::native::decode::{DecodedBlock, decode_block};
+use crate::native::decode::{BlockKind, DecodedBlock, decode_block};
 use crate::native::io::ClickHouseRead;
 use crate::tcp::protocol::{
     DBMS_MIN_PROTOCOL_VERSION_WITH_CHUNKED_PACKETS,
@@ -476,9 +476,9 @@ pub(crate) async fn read_packet<R: ClickHouseRead>(
     match id {
         // Totals (WITH TOTALS) and Extremes (extremes=1) are Native
         // result blocks framed identically to Data (cpp `ReceivePacket`
-        // + clickhouse-go decode them the same way). Decode them through
-        // the Data path so a `WITH TOTALS` / `extremes=1` query does not
-        // poison the connection; they flow to the cursor as data blocks.
+        // + clickhouse-go decode them the same way). They decode through
+        // the Data path and carry their packet's kind, so a reader can
+        // keep them apart from the result rows.
         ServerPacketId::Data | ServerPacketId::Totals | ServerPacketId::Extremes => {
             let (table_name, num_columns, num_rows) =
                 read_data_block_header(r, server_revision).await?;
@@ -491,7 +491,12 @@ pub(crate) async fn read_packet<R: ClickHouseRead>(
                     columns,
                 })
             } else {
-                let block = decode_block(r, num_columns, num_rows, server_revision).await?;
+                let mut block = decode_block(r, num_columns, num_rows, server_revision).await?;
+                block.kind = match id {
+                    ServerPacketId::Totals => BlockKind::Totals,
+                    ServerPacketId::Extremes => BlockKind::Extremes,
+                    _ => BlockKind::Data,
+                };
                 Ok(ServerPacket::DataBlock(block))
             }
         }
@@ -1118,6 +1123,7 @@ mod tests {
         match pkt {
             ServerPacket::DataBlock(block) => {
                 assert_eq!(block.num_rows, 1);
+                assert_eq!(block.kind, BlockKind::Totals, "the packet's kind is kept");
                 match &block.columns[0] {
                     crate::native::decode::DecodedColumn::UInt64(v) => assert_eq!(v, &vec![99u64]),
                     other => panic!("expected UInt64 totals, got {other:?}"),

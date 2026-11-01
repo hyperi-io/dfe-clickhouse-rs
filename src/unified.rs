@@ -20,7 +20,7 @@ use clickhouse::Client;
 use crate::error::{Error, Result};
 use crate::native::decode::decode_block;
 use crate::native::io::ClickHouseRead;
-use crate::native::{DecodedBlock, FromColumn};
+use crate::native::{BlockKind, DecodedBlock, FromColumn};
 use crate::tcp::TcpClient;
 use crate::tcp::protocol::DBMS_TCP_PROTOCOL_VERSION;
 
@@ -188,7 +188,12 @@ pub struct Columns {
 }
 
 impl Columns {
-    /// Every value of column `name`, in server order, across every block.
+    /// Every value of column `name`, in server order, across every result
+    /// block. `WITH TOTALS` and `extremes` rows are left out, and stay in
+    /// [`Self::blocks`] under their [`BlockKind`].
+    ///
+    /// Over HTTP the Native format frames those rows as ordinary blocks, so
+    /// only the TCP arm can leave them out.
     ///
     /// # Errors
     ///
@@ -196,22 +201,26 @@ impl Columns {
     /// not declare `name`, or if the column does not read as `T`.
     pub fn get<T: FromColumn>(&self, name: &str) -> Result<Vec<T>> {
         let mut values = Vec::with_capacity(self.rows());
-        for block in &self.blocks {
+        for block in self.result_blocks() {
             values.extend(block.column_as::<T>(name)?);
         }
         Ok(values)
     }
 
-    /// Rows across every block; schema-only and empty blocks count nothing.
+    /// Result rows across every block; schema-only and empty blocks count
+    /// nothing, and neither do totals or extremes.
     ///
     /// A block's declared count is saturated into `usize`, which only bites on
     /// a 32-bit target that could not have held the block anyway.
     #[must_use]
     pub fn rows(&self) -> usize {
-        self.blocks
-            .iter()
+        self.result_blocks()
             .map(|b| usize::try_from(b.num_rows).unwrap_or(usize::MAX))
             .sum()
+    }
+
+    fn result_blocks(&self) -> impl Iterator<Item = &DecodedBlock> {
+        self.blocks.iter().filter(|b| b.kind == BlockKind::Data)
     }
 
     /// Whether the result set carries no rows.

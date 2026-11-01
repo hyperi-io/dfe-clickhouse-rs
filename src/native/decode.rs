@@ -502,6 +502,23 @@ pub struct DecodedBlock {
     pub schema: Vec<(String, String)>,
     /// Row count the Data packet header declared.
     pub num_rows: u64,
+    /// Which packet carried the block: result rows, or the `WITH TOTALS` or
+    /// `extremes` rows the server adds.
+    pub kind: BlockKind,
+}
+
+/// Which packet a [`DecodedBlock`] arrived in. The three are framed alike on
+/// the wire, and only `Data` carries result rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BlockKind {
+    /// Result rows.
+    #[default]
+    Data,
+    /// The `WITH TOTALS` row.
+    Totals,
+    /// The `extremes = 1` minimum and maximum rows.
+    Extremes,
 }
 
 impl DecodedBlock {
@@ -895,6 +912,7 @@ pub(crate) async fn decode_block<R: ClickHouseRead>(
         columns,
         schema,
         num_rows,
+        kind: BlockKind::Data,
     })
 }
 
@@ -2652,6 +2670,7 @@ mod tests {
             columns: vec![column],
             schema: vec![("c".to_string(), type_name.to_string())],
             num_rows,
+            kind: BlockKind::Data,
         }
     }
 
@@ -2987,6 +3006,7 @@ mod tests {
             columns: Vec::new(),
             schema: vec![("c".to_string(), "UInt64".to_string())],
             num_rows: 0,
+            kind: BlockKind::Data,
         };
         assert!(block.column("c").is_none());
         assert_eq!(block.column_as::<u64>("c").unwrap(), [] as [u64; 0]);
@@ -3001,6 +3021,7 @@ mod tests {
             columns: Vec::new(),
             schema: Vec::new(),
             num_rows: 0,
+            kind: BlockKind::Data,
         };
         assert_eq!(block.column_as::<u64>("c").unwrap(), [] as [u64; 0]);
     }

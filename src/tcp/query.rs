@@ -98,7 +98,9 @@ impl<'a> TcpQuery<'a> {
     /// Run the query and collect every block the server sends, header
     /// block included. Values come out via
     /// [`DecodedBlock::column_as`], which yields nothing for the header
-    /// block, so flat-mapping across the whole vector is the result set.
+    /// block. A `WITH TOTALS` or `extremes` query adds blocks whose
+    /// [`DecodedBlock::kind`] is not `Data`, so the result set is the
+    /// flat-map across the `Data` blocks.
     ///
     /// # Errors
     ///

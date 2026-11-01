@@ -1715,6 +1715,41 @@ async fn a_multi_block_result_reads_back_whole_and_in_order() {
     assert_eq!(http_ns, ns, "transports disagree");
 }
 
+/// `WITH TOTALS` and `extremes = 1` add rows that are not results. Over TCP
+/// they arrive in their own packets, and the rows a caller reads are the
+/// result rows alone, with the totals and extremes blocks still reachable.
+#[tokio::test]
+async fn totals_and_extremes_are_not_result_rows() {
+    use dfe_clickhouse::native::BlockKind;
+
+    const SQL: &str = "SELECT number % 2 AS k, count() AS c FROM numbers(10) \
+                       GROUP BY k WITH TOTALS ORDER BY k SETTINGS extremes = 1";
+
+    require_docker!();
+    let _one = ONE_SERVER.acquire().await.unwrap();
+    let server = server().await;
+    let read = server.tcp().fetch_columns(SQL).await;
+    server.stop().await;
+    let read = read.unwrap();
+
+    assert_eq!(read.get::<u64>("c").unwrap(), [5, 5]);
+    assert_eq!(read.rows(), 2);
+    let kinds: Vec<BlockKind> = read
+        .blocks()
+        .iter()
+        .filter(|b| b.num_rows > 0)
+        .map(|b| b.kind)
+        .collect();
+    assert!(kinds.contains(&BlockKind::Totals), "{kinds:?}");
+    assert!(kinds.contains(&BlockKind::Extremes), "{kinds:?}");
+    let totals = read
+        .blocks()
+        .iter()
+        .find(|b| b.kind == BlockKind::Totals)
+        .unwrap();
+    assert_eq!(totals.column_as::<u64>("c").unwrap(), [10]);
+}
+
 /// An exception raised part-way through a result set must surface as an
 /// error, not as a short read that looks like success.
 #[tokio::test]
