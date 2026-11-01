@@ -175,7 +175,7 @@ impl UnifiedClient {
             cache.insert(&full, std::sync::Arc::clone(&fetched));
             fetched
         };
-        Ok(DynamicInsert::tcp(client.clone(), database, table, schema))
+        Ok(DynamicInsert::tcp(client.clone(), database, table, schema).with_schema_cache(cache))
     }
 }
 

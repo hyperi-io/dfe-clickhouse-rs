@@ -124,7 +124,12 @@ enum Backend {
         cache: Arc<DynamicSchemaCache>,
     },
     #[cfg(feature = "tcp")]
-    Tcp(TcpClient),
+    Tcp {
+        client: TcpClient,
+        /// The cache the caller read the schema from, if any, so a mismatch
+        /// drops the entry there.
+        cache: Option<Arc<DynamicSchemaCache>>,
+    },
 }
 
 /// The sink carrying one INSERT.
@@ -252,7 +257,10 @@ impl DynamicInsert {
     #[cfg(feature = "tcp")]
     pub fn tcp(client: TcpClient, database: &str, table: &str, schema: Arc<DynamicSchema>) -> Self {
         Self {
-            backend: Backend::Tcp(client),
+            backend: Backend::Tcp {
+                client,
+                cache: None,
+            },
             database: database.to_string(),
             table: table.to_string(),
             schema: Some(schema),
@@ -261,6 +269,17 @@ impl DynamicInsert {
             timeouts: InsertTimeouts::default(),
             refresh: SchemaRefresh::default(),
         }
+    }
+
+    /// Name the cache a TCP insert's schema was read from, so a mismatch drops
+    /// it there and the next insert reads the table again. HTTP inserts
+    /// already hold their cache.
+    #[cfg(feature = "tcp")]
+    pub fn with_schema_cache(mut self, schema_cache: Arc<DynamicSchemaCache>) -> Self {
+        if let Backend::Tcp { cache, .. } = &mut self.backend {
+            *cache = Some(schema_cache);
+        }
+        self
     }
 
     /// Bound each step on the client side (default: unbounded here).
@@ -305,7 +324,7 @@ impl DynamicInsert {
                 }
             }
             #[cfg(feature = "tcp")]
-            Backend::Tcp(_) => return Ok(()),
+            Backend::Tcp { .. } => return Ok(()),
         };
         self.schema = Some(schema);
         Ok(())
@@ -345,7 +364,7 @@ impl DynamicInsert {
         let columns = match &self.backend {
             Backend::Http { .. } => insertable_columns(schema),
             #[cfg(feature = "tcp")]
-            Backend::Tcp(_) => select_columns(row, raw_names, schema),
+            Backend::Tcp { .. } => select_columns(row, raw_names, schema),
         };
         if columns.is_empty() {
             return Err(DynamicError::EncodingError {
@@ -383,7 +402,7 @@ impl DynamicInsert {
                 }
             }
             #[cfg(feature = "tcp")]
-            Backend::Tcp(client) => {
+            Backend::Tcp { client, .. } => {
                 let full = self.full_table();
                 let sql = format!("INSERT INTO {target} ({cols_sql}) FORMAT Native");
                 let headers: Vec<(String, String)> = columns
@@ -588,7 +607,8 @@ impl DynamicInsert {
     }
 
     /// Invalidate the cached schema, forcing a re-fetch on the next insert.
-    /// A no-op on the TCP path, where the caller owns the schema.
+    /// Over TCP this insert keeps the schema it was opened with, and drops the
+    /// entry in the cache [`Self::with_schema_cache`] named, if one.
     pub fn invalidate_schema(&mut self) {
         let full = self.full_table();
         match &self.backend {
@@ -597,7 +617,11 @@ impl DynamicInsert {
                 self.schema = None;
             }
             #[cfg(feature = "tcp")]
-            Backend::Tcp(_) => {}
+            Backend::Tcp { cache, .. } => {
+                if let Some(cache) = cache {
+                    cache.invalidate(&full);
+                }
+            }
         }
     }
 
@@ -1101,6 +1125,31 @@ mod tests {
                 server.abort();
             }
         }
+    }
+
+    /// A TCP insert opened from a cached schema drops that cache entry on a
+    /// mismatch, so the retry reads the table again rather than the stale
+    /// schema until its TTL.
+    #[cfg(feature = "unified")]
+    #[tokio::test]
+    async fn a_tcp_mismatch_drops_the_cached_schema_it_opened_from() {
+        let cache = DynamicSchemaCache::new(std::time::Duration::from_secs(300));
+        cache.insert("db.t", Arc::new(schema()));
+        // A cache hit, so nothing is read from this address.
+        let client = crate::unified::UnifiedClient::Tcp(TcpClient::new("127.0.0.1:9"));
+        let mut insert = client
+            .dynamic_insert("db", "t", Arc::clone(&cache))
+            .await
+            .expect("opens from the cache");
+        let mismatch = Err(DynamicError::SchemaMismatch {
+            table: "db.t".into(),
+            message: "drift".into(),
+        });
+        assert!(insert.after(mismatch).is_err());
+        assert!(
+            cache.get("db.t").is_none(),
+            "the stale schema is still cached"
+        );
     }
 
     /// A schema mismatch drops the cached schema by default, and keeps it with
