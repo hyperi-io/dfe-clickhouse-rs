@@ -182,8 +182,9 @@ pub(crate) enum ConnectionCmd {
     /// to [`ActorState::Idle`] so the connection can be reused.
     FinishInsert { reply: oneshot::Sender<Result<()>> },
     /// Run a streaming SELECT, forwarding each server packet through
-    /// `results`. Receiver drop triggers a protocol Cancel plus a
-    /// bounded drain; a mid-stream Exception is forwarded as `Err`.
+    /// `results`. `issued` answers once the query is on the wire, or with
+    /// the error that kept it off. Receiver drop triggers a protocol Cancel
+    /// plus a bounded drain; a mid-stream Exception is forwarded as `Err`.
     /// Decoding happens inside the reader sub-task, so this command is
     /// purely a forwarding pipeline.
     ExecuteStream {
@@ -191,6 +192,7 @@ pub(crate) enum ConnectionCmd {
         query: String,
         extra_settings: Vec<(String, String)>,
         params: Vec<(String, String)>,
+        issued: oneshot::Sender<Result<()>>,
         results: mpsc::Sender<Result<ServerPacket>>,
     },
 }
@@ -394,10 +396,16 @@ impl ConnectionHandle {
     /// Dropping the receiver triggers a protocol Cancel plus a bounded
     /// drain inside the actor, leaving the connection reusable.
     ///
+    /// Returns once the query is issued, so a failure to put it on the
+    /// wire is this call's error, inside a caller's retry, rather than the
+    /// first frame of a cursor already handed back.
+    ///
     /// # Errors
     ///
-    /// [`Error::Custom`] if the actor has exited. Every later error
-    /// reaches the caller through `results`, not this return.
+    /// [`Error::Custom`] if the actor has exited, or whatever kept the
+    /// query off the wire (a write failure or timeout, a poisoned
+    /// connection, an INSERT in progress). Every later error reaches the
+    /// caller through `results`.
     pub(crate) async fn execute_stream(
         &self,
         query_id: String,
@@ -406,16 +414,20 @@ impl ConnectionHandle {
         params: Vec<(String, String)>,
         results: mpsc::Sender<Result<ServerPacket>>,
     ) -> Result<()> {
+        let (issued, rx) = oneshot::channel();
         self.inner
             .send(ConnectionCmd::ExecuteStream {
                 query_id,
                 query,
                 extra_settings,
                 params,
+                issued,
                 results,
             })
             .await
-            .map_err(|_| Error::Custom("tcp: connection actor closed".into()))
+            .map_err(|_| Error::Custom("tcp: connection actor closed".into()))?;
+        rx.await
+            .map_err(|_| Error::Custom("tcp: connection actor dropped the stream".into()))?
     }
 
     /// Open a streaming SELECT and hand back a
@@ -427,9 +439,9 @@ impl ConnectionHandle {
     ///
     /// # Errors
     ///
-    /// - [`Error::Custom`] if the actor command channel is closed.
-    /// - The first error returned by the actor reaches the caller via
-    ///   `TcpRawCursor::next_block()`, not this constructor.
+    /// As [`Self::execute_stream`]: the query is issued before the cursor
+    /// is returned. Errors after that reach the caller via
+    /// `TcpRawCursor::next_block()`.
     pub async fn execute_stream_cursor(
         &self,
         query_id: String,
@@ -1041,6 +1053,7 @@ impl ConnectionActor {
         query: String,
         extra_settings: Vec<(String, String)>,
         params: Vec<(String, String)>,
+        issued: oneshot::Sender<Result<()>>,
         results: mpsc::Sender<Result<ServerPacket>>,
     ) {
         if let Err(e) = self
@@ -1048,9 +1061,12 @@ impl ConnectionActor {
             .await
         {
             self.poisoned.store(true, Ordering::Release);
-            let _ = results.send(Err(e)).await;
+            let _ = issued.send(Err(e));
             return;
         }
+        // A caller that gave up before the query went out still gets the
+        // Cancel and drain below, through `results.closed()`.
+        let _ = issued.send(Ok(()));
 
         loop {
             self.arm_idle();
@@ -1178,7 +1194,7 @@ impl CommandWorker for ConnectionActor {
             ConnectionCmd::SendInsertBlock { .. } | ConnectionCmd::FinishInsert { .. }
         );
         if self.poisoned.load(Ordering::Acquire) && !continues_insert {
-            reject_poisoned(cmd).await;
+            reject_poisoned(cmd);
             return;
         }
 
@@ -1196,12 +1212,10 @@ impl CommandWorker for ConnectionActor {
             (ActorState::InsertActive, ConnectionCmd::BeginInsert { reply, .. }) => {
                 let _ = reply.send(Err(Error::Custom("tcp: actor already in INSERT".into())));
             }
-            (ActorState::InsertActive, ConnectionCmd::ExecuteStream { results, .. }) => {
-                // One Err frame so the cursor's first poll surfaces the
-                // misuse; the caller can finish_insert and retry.
-                let _ = results
-                    .send(Err(Error::Custom("tcp: actor busy in INSERT".into())))
-                    .await;
+            (ActorState::InsertActive, ConnectionCmd::ExecuteStream { issued, .. }) => {
+                // The misuse is the open call's error; the caller can
+                // finish_insert and retry.
+                let _ = issued.send(Err(Error::Custom("tcp: actor busy in INSERT".into())));
             }
             (
                 ActorState::Idle,
@@ -1291,13 +1305,14 @@ impl CommandWorker for ConnectionActor {
                     query,
                     extra_settings,
                     params,
+                    issued,
                     results,
                 },
             ) => {
                 // do_execute_stream owns `results` for the full command
                 // lifetime so it can watch `results.closed()` and react
                 // to receiver-drop at protocol level.
-                self.do_execute_stream(query_id, query, extra_settings, params, results)
+                self.do_execute_stream(query_id, query, extra_settings, params, issued, results)
                     .await;
             }
         }
@@ -1360,7 +1375,7 @@ where
 
 /// Answer a command without touching the socket. [`Error::Transient`] because
 /// a fresh connection may succeed where this one cannot.
-async fn reject_poisoned(cmd: ConnectionCmd) {
+fn reject_poisoned(cmd: ConnectionCmd) {
     let refusal = || Error::Transient("tcp: connection is poisoned; command not sent".into());
     match cmd {
         ConnectionCmd::Ping { reply }
@@ -1372,8 +1387,8 @@ async fn reject_poisoned(cmd: ConnectionCmd) {
         ConnectionCmd::BeginInsert { reply, .. } => {
             let _ = reply.send(Err(refusal()));
         }
-        ConnectionCmd::ExecuteStream { results, .. } => {
-            let _ = results.send(Err(refusal())).await;
+        ConnectionCmd::ExecuteStream { issued, .. } => {
+            let _ = issued.send(Err(refusal()));
         }
     }
 }
@@ -1985,7 +2000,7 @@ mod tests {
     /// A SELECT issued during an INSERT is caller misuse; the cursor
     /// must surface it rather than hang, and the actor must survive.
     #[tokio::test]
-    async fn execute_stream_during_insert_yields_one_err_frame() {
+    async fn execute_stream_during_insert_fails_before_a_cursor_is_returned() {
         let (handle, mut server) = paired().await;
 
         let server_task = tokio::spawn(async move {
@@ -2005,14 +2020,14 @@ mod tests {
             .await
             .expect("begin_insert should succeed");
 
-        let mut cursor = handle
+        // The cursor is handed back only once the query is issued, so the
+        // misuse is the call's own error and a retry policy can act on it.
+        let Err(err) = handle
             .execute_stream_cursor("rs_busy".into(), "SELECT 1".into(), Vec::new(), Vec::new())
             .await
-            .expect("dispatch succeeds; the misuse surfaces on the cursor");
-        let err = cursor
-            .next_block()
-            .await
-            .expect_err("a SELECT during an INSERT must surface an error");
+        else {
+            panic!("a SELECT during an INSERT must fail before a cursor is returned");
+        };
         match err {
             Error::Custom(msg) => assert!(msg.contains("busy in INSERT"), "got {msg}"),
             other => panic!("expected Custom, got {other:?}"),
