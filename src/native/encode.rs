@@ -774,13 +774,21 @@ mod tests {
         // NULL, "a", "b", "": "a" is shared, "" is not folded into NULL.
         assert_eq!(&data[16..24], &4u64.to_le_bytes(), "dictionary size");
 
-        assert_eq!(&data[24..25], &[0], "slot 0, NULL, written as the empty string");
+        assert_eq!(
+            &data[24..25],
+            &[0],
+            "slot 0, NULL, written as the empty string"
+        );
         assert_eq!(&data[25..27], b"\x01a");
         assert_eq!(&data[27..29], b"\x01b");
         assert_eq!(&data[29..30], &[0], "the non-null empty string");
 
         assert_eq!(&data[30..38], &6u64.to_le_bytes(), "index count");
-        assert_eq!(&data[38..44], &[1, 0, 2, 0, 1, 3], "only NULLs index slot 0");
+        assert_eq!(
+            &data[38..44],
+            &[1, 0, 2, 0, 1, 3],
+            "only NULLs index slot 0"
+        );
     }
 
     /// The index width widens with the dictionary, and the server reads it from
