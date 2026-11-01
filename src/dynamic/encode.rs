@@ -830,69 +830,76 @@ fn datetime64_to_ticks(value: &Value, precision: u8, col: &str) -> Result<i64, D
 // Enum
 // ---------------------------------------------------------------------------
 
-/// Resolve an enum value to its signed discriminant. A numeric value is used
-/// directly; a string is mapped via the `Enum8(...)` / `Enum16(...)` member
-/// list parsed from the type string.
-fn enum_discriminant(value: &Value, type_str: &str, col: &str) -> Result<i64, DynamicError> {
-    match value {
-        Value::Number(_) | Value::Bool(_) => as_i64(value, col),
-        Value::String(s) => {
-            // A numeric string is treated as the discriminant directly.
-            if let Ok(n) = s.trim().parse::<i64>() {
-                return Ok(n);
-            }
-            enum_member_value(type_str, s)
-                .ok_or_else(|| enc_err(col, "enum string not found in type definition"))
-        }
-        _ => Err(enc_err(col, "expected enum value")),
-    }
-}
-
-/// Look up `name` in an `Enum8(...)`/`Enum16(...)` definition, returning its
-/// integer discriminant. Members look like `'name' = 1` separated by commas.
+/// Resolve an enum value to the discriminant of one of the column's declared
+/// members. A number (or numeric string) must be a member's value and a
+/// string a member's name: the server stores any discriminant it is sent as
+/// RowBinary or Native, so an undeclared one is refused here as a bad value.
 ///
-/// The split is quote-aware: a member label may itself contain a comma, as in
-/// `Enum8('a,b' = 1)`.
-fn enum_member_value(type_str: &str, name: &str) -> Option<i64> {
-    let open = type_str.find('(')?;
-    let close = type_str.rfind(')')?;
-    if open >= close {
-        return None;
+/// The messages name neither the value nor the members, which are customer
+/// data.
+fn enum_discriminant(value: &Value, type_str: &str, col: &str) -> Result<i64, DynamicError> {
+    let members = enum_members(type_str);
+    let discriminant = match value {
+        Value::Number(_) | Value::Bool(_) => as_i64(value, col)?,
+        Value::String(s) => match s.trim().parse::<i64>() {
+            Ok(n) => n,
+            Err(_) => {
+                return members
+                    .iter()
+                    .find(|(label, _)| label == s)
+                    .map(|&(_, n)| n)
+                    .ok_or_else(|| enc_err(col, "enum string not found in type definition"));
+            }
+        },
+        _ => return Err(enc_err(col, "expected enum value")),
+    };
+    if members.iter().any(|&(_, n)| n == discriminant) {
+        Ok(discriminant)
+    } else {
+        Err(enc_err(
+            col,
+            "enum value is not one of the column's members",
+        ))
     }
-    for member in split_enum_members(&type_str[open + 1..close]) {
-        let (label, num) = member.split_once('=')?;
-        let label = label.trim().trim_matches('\'').trim_matches('"');
-        if label == name {
-            return num.trim().parse::<i64>().ok();
-        }
-    }
-    None
 }
 
-/// Split an enum member list on the commas that sit outside a quoted label.
-fn split_enum_members(inner: &str) -> Vec<&str> {
+/// The members of the `Enum8(...)` / `Enum16(...)` in `type_str`, wrapped or
+/// not (`Nullable(Enum8(...))`), as `(name, value)`. Members read
+/// `'name' = 1`, with `\'` and `\\` escapes inside the quotes, and a label
+/// may hold a comma.
+fn enum_members(type_str: &str) -> Vec<(String, i64)> {
+    let Some(start) = ["Enum8(", "Enum16("]
+        .iter()
+        .find_map(|head| type_str.find(head).map(|at| at + head.len()))
+    else {
+        return Vec::new();
+    };
     let mut members = Vec::new();
-    let mut quote: Option<char> = None;
-    let mut start = 0;
-    let mut escaped = false;
-    for (i, c) in inner.char_indices() {
-        if escaped {
-            escaped = false;
-        } else if c == '\\' && quote.is_some() {
-            escaped = true;
-        } else if let Some(q) = quote {
-            if c == q {
-                quote = None;
+    let mut chars = type_str[start..].chars().peekable();
+    loop {
+        while chars.next_if(|c| c.is_whitespace() || *c == ',').is_some() {}
+        if chars.next() != Some('\'') {
+            return members;
+        }
+        let mut name = String::new();
+        loop {
+            match chars.next() {
+                Some('\\') => name.extend(chars.next()),
+                Some('\'') => break,
+                Some(c) => name.push(c),
+                None => return members,
             }
-        } else if c == '\'' || c == '"' {
-            quote = Some(c);
-        } else if c == ',' {
-            members.push(&inner[start..i]);
-            start = i + 1;
+        }
+        while chars.next_if(|c| c.is_whitespace() || *c == '=').is_some() {}
+        let mut digits = String::new();
+        while let Some(c) = chars.next_if(|c| c.is_ascii_digit() || *c == '-') {
+            digits.push(c);
+        }
+        match digits.parse() {
+            Ok(value) => members.push((name, value)),
+            Err(_) => return members,
         }
     }
-    members.push(&inner[start..]);
-    members
 }
 
 // ---------------------------------------------------------------------------
@@ -1440,6 +1447,37 @@ mod tests {
             matches!(e, DynamicError::EncodingError { .. }),
             "got: {e:?}"
         );
+    }
+
+    /// The server stores whatever discriminant it is sent, so a value that is
+    /// no member's is refused here.
+    #[test]
+    fn an_undeclared_enum_value_is_refused() {
+        for value in [json!(5), json!("4"), json!(-2), json!(true)] {
+            let e = enc_err_of(json!({ "e": value }), &[("e", "Enum8('a' = 2, 'b' = 3)")]);
+            assert!(
+                matches!(e, DynamicError::EncodingError { .. }),
+                "{value}: {e:?}"
+            );
+        }
+        assert_eq!(
+            enc(json!({"e": "3"}), &[("e", "Enum8('a' = 2, 'b' = 3)")]),
+            vec![3]
+        );
+    }
+
+    /// `(type, label, discriminant)`: a wrapper, a comma and an escaped quote
+    /// in a label, and a negative value all resolve.
+    #[test]
+    fn enum_labels_resolve_through_wrappers_and_escapes() {
+        for (ty, label, want) in [
+            ("Nullable(Enum8('on' = 1, 'off' = 2))", "off", vec![0, 2]),
+            ("Enum8('a,b' = 1, 'c' = 2)", "a,b", vec![1]),
+            (r"Enum8('it\'s' = 4)", "it's", vec![4]),
+            ("Enum8('neg' = -2, 'pos' = 2)", "neg", vec![0xfe]),
+        ] {
+            assert_eq!(enc(json!({ "e": label }), &[("e", ty)]), want, "{ty}");
+        }
     }
 
     // ---- Nullable ----
