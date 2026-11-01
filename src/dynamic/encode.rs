@@ -38,14 +38,7 @@ use crate::native::io::ClickHouseBytesWrite;
 use super::datetime::{self, civil_days_from_epoch, days_in_month};
 use super::error::DynamicError;
 use super::parsed_type::{ParsedType, TypeTag};
-
-/// The key a root-level JSON array is stored under in a `ClickHouse` JSON
-/// column.
-///
-/// The underscore prefix marks a field the writer injected rather than one the
-/// source carried, so a reader can tell the wrapper apart from an object that
-/// genuinely had a `values` key.
-pub const JSON_ARRAY_WRAPPER_KEY: &str = "_values";
+use super::shape::json_column_text;
 
 /// A single resolved column for a dynamic insert.
 #[derive(Debug, Clone)]
@@ -399,21 +392,9 @@ fn encode_typed(
             encode_map(value, kt, vt, col, buf)?;
         }
         TypeTag::Point => encode_point(value, col, buf)?,
-        TypeTag::JSON => {
-            // JSON goes on the wire as a length-prefixed String of JSON text. A
-            // Value::String is already that text, so it is written verbatim.
-            // Missing and empty become `{}`, because the column's JSON parser
-            // rejects the text `null` and empty input (code 117). A root-level
-            // array is wrapped -- see `wrap_root_array`.
-            let json_bytes = match value {
-                Value::Null => Cow::Borrowed("{}".as_bytes()),
-                Value::String(s) if s.is_empty() => Cow::Borrowed("{}".as_bytes()),
-                Value::String(s) => Cow::Borrowed(s.as_bytes()),
-                Value::Array(_) => Cow::Owned(wrap_root_array(value, col)?),
-                _ => Cow::Owned(value.to_string().into_bytes()),
-            };
-            buf.put_string(&json_bytes);
-        }
+        // JSON goes on the wire as a length-prefixed String of JSON text, in
+        // the form `shape::json_column_text` gives any value.
+        TypeTag::JSON => buf.put_string(json_column_text(value)),
         // Variant, Dynamic, Tuple and anything the parser did not recognise
         // have no encoding here. Reject rather than write bytes the server
         // would read as a different value.
@@ -489,24 +470,6 @@ fn write_default(pt: &ParsedType, col: &str, buf: &mut Vec<u8>) -> Result<(), Dy
         buf.put_var_uint(0);
     }
     Ok(())
-}
-
-/// Render a root-level array as the JSON text `{"_values": [...]}`.
-///
-/// ClickHouse's JSON type parses only an object at its root and rejects an
-/// array with code 117 (`JSON object should start with '{'`), which would
-/// otherwise make an array-valued field such as ECS `tags` unwritable. Only the
-/// root is reshaped: an array nested inside an object already parses, and lands
-/// as a `Dynamic` holding `Array(...)`.
-fn wrap_root_array(array: &Value, col: &str) -> Result<Vec<u8>, DynamicError> {
-    let mut out = Vec::with_capacity(64);
-    out.extend_from_slice(b"{\"");
-    out.extend_from_slice(JSON_ARRAY_WRAPPER_KEY.as_bytes());
-    out.extend_from_slice(b"\":");
-    serde_json::to_writer(&mut out, array)
-        .map_err(|e| enc_err(col, &format!("JSON array not serialisable: {e}")))?;
-    out.push(b'}');
-    Ok(out)
 }
 
 fn enc_err(col: &str, msg: &str) -> DynamicError {
@@ -1701,13 +1664,9 @@ mod tests {
             json!({"_tags": ["beats", "filebeat"]}),
             &[("_tags", "JSON")],
         );
-        assert_eq!(bytes, json_col(r#"{"_values":["beats","filebeat"]}"#));
-    }
-
-    #[test]
-    fn json_empty_root_array_is_wrapped() {
+        assert_eq!(bytes, json_col(r#"{"list":["beats","filebeat"]}"#));
         let bytes = enc(json!({"_tags": []}), &[("_tags", "JSON")]);
-        assert_eq!(bytes, json_col(r#"{"_values":[]}"#));
+        assert_eq!(bytes, json_col(r#"{"list":[]}"#));
     }
 
     #[test]
@@ -1735,16 +1694,22 @@ mod tests {
     }
 
     #[test]
-    fn json_root_scalars_are_not_wrapped() {
-        assert_eq!(enc(json!({"d": 42}), &[("d", "JSON")]), json_col("42"));
-        assert_eq!(enc(json!({"d": true}), &[("d", "JSON")]), json_col("true"));
+    fn json_root_scalars_and_plain_text_are_wrapped() {
+        assert_eq!(
+            enc(json!({"d": 42}), &[("d", "JSON")]),
+            json_col(r#"{"value":42}"#)
+        );
+        assert_eq!(
+            enc(json!({"d": "plain"}), &[("d", "JSON")]),
+            json_col(r#"{"value":"plain"}"#)
+        );
     }
 
     #[test]
     fn nullable_json_root_array_is_wrapped() {
         let bytes = enc(json!({"t": ["a"]}), &[("t", "Nullable(JSON)")]);
         let mut expected = vec![0u8];
-        expected.extend_from_slice(&json_col(r#"{"_values":["a"]}"#));
+        expected.extend_from_slice(&json_col(r#"{"list":["a"]}"#));
         assert_eq!(bytes, expected);
     }
 

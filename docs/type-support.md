@@ -56,9 +56,10 @@ pins each.
 
 Two limits worth knowing before sending data:
 
-- A root-level JSON array is not a document ClickHouse will accept, so the
-  dynamic encoder wraps one as `{"_values": [...]}`. An array nested inside an
-  object is untouched.
+- A JSON column takes only an object at its root, so the dynamic encoder wraps
+  anything else: an array as `{"list": [...]}`, and a number, a bool or text
+  that is not JSON as `{"value": ...}`. JSON text in a string is stored as the
+  document it holds. An array nested inside an object is untouched.
 - An integer too wide for any ClickHouse integer type is stored as a `Float64`
   and silently rounded -- about 17 significant digits survive, with no error.
   Send such fields as strings.
