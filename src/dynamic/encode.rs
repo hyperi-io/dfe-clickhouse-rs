@@ -816,24 +816,48 @@ fn to_epoch_days(value: &Value, col: &str) -> Result<i32, DynamicError> {
 }
 
 /// Convert a JSON value to `DateTime64` epoch ticks at the given precision.
+///
+/// A number, or numeric text, is an epoch in seconds, milliseconds,
+/// microseconds or nanoseconds, told apart by magnitude as for `DateTime`, and
+/// rescaled to the column's precision: epoch milliseconds into a
+/// `DateTime64(6)` land at the instant they name.
 fn datetime64_to_ticks(value: &Value, precision: u8, col: &str) -> Result<i64, DynamicError> {
-    match value {
+    let epoch = match value {
         Value::Number(n) => n
             .as_i64()
             .or_else(|| n.as_f64().and_then(whole_f64_as_i64))
-            .ok_or_else(|| enc_err(col, "invalid DateTime64 number")),
+            .ok_or_else(|| enc_err(col, "invalid DateTime64 number"))?,
         Value::String(s) => {
             let s = s.trim();
-            // A numeric string is treated as an already-scaled tick count.
-            if let Ok(n) = s.parse::<i64>() {
-                return Ok(n);
+            match s.parse::<i64>() {
+                Ok(n) => n,
+                Err(_) => {
+                    return datetime::parse(s)
+                        .map_err(|m| enc_err(col, m))?
+                        .ticks(precision)
+                        .ok_or_else(|| enc_err(col, "DateTime64 epoch overflow"));
+                }
             }
-            datetime::parse(s)
-                .map_err(|m| enc_err(col, m))?
-                .ticks(precision)
-                .ok_or_else(|| enc_err(col, "DateTime64 epoch overflow"))
         }
-        _ => Err(enc_err(col, "expected number or datetime string")),
+        _ => return Err(enc_err(col, "expected number or datetime string")),
+    };
+    epoch_to_ticks(epoch, precision).ok_or_else(|| enc_err(col, "DateTime64 epoch overflow"))
+}
+
+/// Rescale an epoch of magnitude-detected units (see [`epoch_to_seconds`]) to
+/// ticks of `precision` fraction digits. `None` past the range of `i64`.
+fn epoch_to_ticks(epoch: i64, precision: u8) -> Option<i64> {
+    let digits: u32 = match epoch.unsigned_abs() {
+        m if m > 1_000_000_000_000_000_000 => 9,
+        m if m > 1_000_000_000_000_000 => 6,
+        m if m > 1_000_000_000_000 => 3,
+        _ => 0,
+    };
+    let precision = u32::from(precision.min(9));
+    if precision >= digits {
+        epoch.checked_mul(10_i64.pow(precision - digits))
+    } else {
+        Some(epoch / 10_i64.pow(digits - precision))
     }
 }
 
@@ -1290,6 +1314,37 @@ mod tests {
             enc(json!({"ts": v}), &[("ts", "DateTime64(3)")]),
             v.to_le_bytes()
         );
+    }
+
+    /// `(epoch, precision, ticks)`: seconds, milliseconds, microseconds and
+    /// nanoseconds each land at the column's precision, pre-1970 too.
+    #[test]
+    fn a_numeric_epoch_is_rescaled_to_the_column_precision() {
+        for (epoch, precision, ticks) in [
+            (1_775_545_380_i64, 3, 1_775_545_380_000_i64),
+            (1_775_545_380_095, 6, 1_775_545_380_095_000),
+            (1_775_545_380_095_123, 3, 1_775_545_380_095),
+            (1_775_545_380_095_123_456, 9, 1_775_545_380_095_123_456),
+            (1_775_545_380_095_123_456, 0, 1_775_545_380),
+            (-1_775_545_380_095, 3, -1_775_545_380_095),
+        ] {
+            assert_eq!(
+                enc(
+                    json!({ "ts": epoch }),
+                    &[("ts", &format!("DateTime64({precision})"))]
+                ),
+                ticks.to_le_bytes(),
+                "{epoch} at {precision}"
+            );
+            assert_eq!(
+                enc(
+                    json!({ "ts": epoch.to_string() }),
+                    &[("ts", &format!("DateTime64({precision})"))]
+                ),
+                ticks.to_le_bytes(),
+                "text {epoch} at {precision}"
+            );
+        }
     }
 
     #[test]
