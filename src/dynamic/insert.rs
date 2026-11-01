@@ -59,6 +59,13 @@ use crate::tcp::{TcpClient, TcpInsertSession};
 /// columns on the wire.
 const JSON_AS_STRING_SETTING: &str = "input_format_binary_read_json_as_string";
 
+/// The server setting that makes a `RowBinaryWithDefaults` reader fill a
+/// flagged column with its DEFAULT expression. Off, it writes the type's zero.
+/// Set on every HTTP insert, so a client default or a user profile cannot turn
+/// it off: a request setting overrides both, and a profile constraint that
+/// forbids it fails the INSERT loudly.
+const DEFAULTS_FOR_OMITTED_SETTING: &str = "input_format_defaults_for_omitted_fields";
+
 /// Send the buffered rows once they reach this many encoded bytes: an HTTP
 /// chunk, or a TCP block if the row cap has not come first. A row cap alone
 /// lets a wide row buffer a gigabyte before the first send.
@@ -300,7 +307,9 @@ impl DynamicInsert {
         let sink = match &self.backend {
             Backend::Http { client, .. } => {
                 let sql = format!("INSERT INTO {target} ({cols_sql}) FORMAT RowBinaryWithDefaults");
-                let mut client = client.clone();
+                let mut client = client
+                    .clone()
+                    .with_setting(DEFAULTS_FOR_OMITTED_SETTING, "1");
                 if json_columns {
                     client = client.with_setting(JSON_AS_STRING_SETTING, "1");
                 }

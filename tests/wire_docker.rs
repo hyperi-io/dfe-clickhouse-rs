@@ -2079,8 +2079,20 @@ async fn a_defaulted_column_is_kept_or_defaulted_row_by_row() {
         .await
         .unwrap();
 
+    // A client default that would make the server write the type's zero for a
+    // flagged column instead of its DEFAULT expression.
+    let http_defaults_off = UnifiedClient::Http(
+        Client::default()
+            .with_url(format!("http://{}:{}", server.host, server.http_port))
+            .with_setting("input_format_defaults_for_omitted_fields", "0"),
+    );
+
     let mut failures = Vec::new();
-    for (name, client) in [("http", &http), ("tcp", &tcp)] {
+    for (name, client) in [
+        ("http", &http),
+        ("httpoff", &http_defaults_off),
+        ("tcp", &tcp),
+    ] {
         for (i, rows) in ORDERS.iter().enumerate() {
             let table = format!("defaults_{name}_{i}");
             tcp.execute(&format!(
@@ -2105,17 +2117,20 @@ async fn a_defaulted_column_is_kept_or_defaulted_row_by_row() {
     }
 
     tcp.execute("SYSTEM FLUSH LOGS").await.unwrap();
-    for i in 0..ORDERS.len() {
+    for (name, i) in ["http", "httpoff"]
+        .into_iter()
+        .flat_map(|name| (0..ORDERS.len()).map(move |i| (name, i)))
+    {
         let inserts = tcp
             .fetch_columns(&format!(
                 "SELECT count() AS c FROM system.query_log WHERE type = 'QueryFinish' \
-                 AND query LIKE 'INSERT INTO `wire`.`defaults_http_{i}`%'"
+                 AND query LIKE 'INSERT INTO `wire`.`defaults_{name}_{i}`%'"
             ))
             .await
             .and_then(|c| c.get::<u64>("c"));
         if !inserts.as_ref().is_ok_and(|c| *c == [1]) {
             failures.push(format!(
-                "http order {i}: INSERT count {inserts:?}, wanted 1"
+                "{name} order {i}: INSERT count {inserts:?}, wanted 1"
             ));
         }
     }
