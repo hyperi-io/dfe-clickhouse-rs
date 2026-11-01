@@ -50,9 +50,7 @@ tls = [
 # Block compression is upstream's; this crate negotiates `None` on TCP.
 lz4 = ["clickhouse/lz4"]
 zstd = ["clickhouse/zstd"]
-# `ext` carries the server-exception parser the insert-error classifier reads
-# the ClickHouse error code out of.
-dynamic = ["dep:serde_json", "ext"]
+dynamic = ["dep:serde_json"]
 unified = ["tcp"]
 ext = []
 full = [
