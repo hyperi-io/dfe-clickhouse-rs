@@ -1776,9 +1776,10 @@ const DFE_TYPES: &[DfeType] = &[
     reads("String", &[(r#""x""#, "x"), (r#""""#, "")]),
     reads("Nullable(String)", &[("null", "NULL"), (r#""x""#, "x")]),
     reads("LowCardinality(String)", &[(r#""lc""#, "lc")]),
+    // An empty string shares its bytes with the NULL slot's placeholder.
     reads(
         "LowCardinality(Nullable(String))",
-        &[("null", "NULL"), (r#""lc""#, "lc")],
+        &[("null", "NULL"), (r#""lc""#, "lc"), (r#""""#, "")],
     ),
     reads("Int32", &[("-2147483648", "-2147483648")]),
     reads("Int64", &[("-9223372036854775808", "-9223372036854775808")]),

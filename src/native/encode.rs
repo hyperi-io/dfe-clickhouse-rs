@@ -241,9 +241,9 @@ fn write_col_values(values: &[&[u8]], col_type: &ColumnType, out: &mut Vec<u8>) 
                 std::collections::HashMap::default();
 
             if is_nullable_inner {
-                // Index 0 is the default T value, standing for NULL.
+                // Index 0 is NULL, written as the default T. It stays out of
+                // `seen`, or a non-null default such as "" would map onto it.
                 rb_write_default(&mut default_val, dict_type);
-                seen.insert(&default_val, 0);
                 dict.push(&default_val);
             }
 
@@ -750,11 +750,12 @@ mod tests {
         assert_eq!(&data[16..24], &2u64.to_le_bytes(), "dictionary size");
     }
 
-    /// `LowCardinality(Nullable(T))` reserves dictionary slot 0 for the default
-    /// value and points every NULL row at it. Getting this wrong writes a real
-    /// value where the caller sent NULL, which the server accepts happily.
+    /// `LowCardinality(Nullable(T))` reserves dictionary slot 0 for NULL and
+    /// points every NULL row at it, and only NULL rows. Getting this wrong
+    /// writes a real value where the caller sent NULL, or NULL where the caller
+    /// sent the type's default, and the server accepts either happily.
     #[test]
-    fn lowcardinality_nullable_points_every_null_at_dictionary_slot_zero() {
+    fn lowcardinality_nullable_points_every_null_and_only_null_at_slot_zero() {
         // RowBinary Nullable: [0x01] is NULL, [0x00, ...] is Some.
         let rows = vec![
             vec![0x00u8, 1, b'a'], // Some("a")
@@ -762,6 +763,7 @@ mod tests {
             vec![0x00u8, 1, b'b'], // Some("b")
             vec![0x01u8],          // NULL
             vec![0x00u8, 1, b'a'], // Some("a") again -- must reuse its slot
+            vec![0x00u8, 0],       // Some("") -- the default, but not NULL
         ];
         let t = "LowCardinality(Nullable(String))";
         let out = encode_columns(&rows, &schema(t), 0).expect("encodes");
@@ -769,16 +771,16 @@ mod tests {
 
         assert_eq!(&data[..8], &1u64.to_le_bytes(), "version");
         assert_eq!(&data[8..16], &0x200u64.to_le_bytes(), "additional keys, u8");
-        // Slot 0 is the default, then "a" and "b": three entries, not four.
-        assert_eq!(&data[16..24], &3u64.to_le_bytes(), "dictionary size");
+        // NULL, "a", "b", "": "a" is shared, "" is not folded into NULL.
+        assert_eq!(&data[16..24], &4u64.to_le_bytes(), "dictionary size");
 
-        // Dictionary: empty string (the default), "a", "b".
-        assert_eq!(&data[24..25], &[0], "slot 0 is the default empty string");
+        assert_eq!(&data[24..25], &[0], "slot 0, NULL, written as the empty string");
         assert_eq!(&data[25..27], b"\x01a");
         assert_eq!(&data[27..29], b"\x01b");
+        assert_eq!(&data[29..30], &[0], "the non-null empty string");
 
-        assert_eq!(&data[29..37], &5u64.to_le_bytes(), "index count");
-        assert_eq!(&data[37..42], &[1, 0, 2, 0, 1], "NULLs index slot 0");
+        assert_eq!(&data[30..38], &6u64.to_le_bytes(), "index count");
+        assert_eq!(&data[38..44], &[1, 0, 2, 0, 1, 3], "only NULLs index slot 0");
     }
 
     /// The index width widens with the dictionary, and the server reads it from
