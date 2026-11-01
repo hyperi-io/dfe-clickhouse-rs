@@ -347,6 +347,15 @@ impl ParsedType {
             return result;
         }
 
+        // A geo shape is an array of points on the wire, so it encodes through
+        // the Array arm while `base` keeps the name `system.columns` reported.
+        if let Some(element) = geo_shape_element(&type_str) {
+            result.tag = TypeTag::Array;
+            result.array_element = Some(Box::new(Self::parse(element)));
+            result.base = type_str;
+            return result;
+        }
+
         // Simple type — `type_str` is the owned, unwrapped `String` and is not
         // used after this, so move it rather than clone.
         result.base = type_str;
@@ -501,6 +510,17 @@ impl ParsedType {
             "FixedString" => self.fixed_size,
             _ => None,
         }
+    }
+}
+
+/// The element type of a ClickHouse geo shape, which is an `Array` of it.
+fn geo_shape_element(base: &str) -> Option<&'static str> {
+    match base {
+        "Ring" | "LineString" => Some("Point"),
+        "Polygon" => Some("Ring"),
+        "MultiLineString" => Some("LineString"),
+        "MultiPolygon" => Some("Polygon"),
+        _ => None,
     }
 }
 
@@ -699,6 +719,28 @@ mod tests {
     fn test_display() {
         let t = ParsedType::parse("LowCardinality(Nullable(String))");
         assert_eq!(t.to_string(), "LowCardinality(Nullable(String))");
+    }
+
+    #[test]
+    fn a_geo_shape_is_an_array_down_to_its_points() {
+        for (raw, arrays) in [
+            ("Ring", 1),
+            ("LineString", 1),
+            ("Polygon", 2),
+            ("MultiLineString", 2),
+            ("MultiPolygon", 3),
+        ] {
+            let t = ParsedType::parse(raw);
+            assert_eq!(t.base, raw, "base keeps the reported name");
+            assert_eq!(t.category(), "Geo", "{raw}");
+            assert_eq!(t.fixed_byte_size(), None, "{raw} is variable length");
+            let mut level = &t;
+            for _ in 0..arrays {
+                assert_eq!(level.tag, TypeTag::Array, "{raw}");
+                level = level.array_element.as_deref().expect("an element type");
+            }
+            assert_eq!(level.tag, TypeTag::Point, "{raw} must bottom out at Point");
+        }
     }
 
     #[test]
