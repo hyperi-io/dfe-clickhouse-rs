@@ -666,8 +666,8 @@ impl ConnectionActor {
     }
 
     /// Write the Query packet and the empty-block terminator that ends
-    /// the pre-query phase. Either failing leaves the wire half-written,
-    /// so every caller poisons on `Err`.
+    /// the pre-query phase, together under the I/O deadline. Either failing
+    /// leaves the wire half-written, so every caller poisons on `Err`.
     async fn issue_query(
         &mut self,
         query_id: &str,
@@ -677,17 +677,21 @@ impl ConnectionActor {
     ) -> Result<()> {
         let client_info = self.client_info_for(query_id);
         let revision = self.server_hello.revision;
-        writer::send_query(
-            &mut self.writer,
-            revision,
-            query_id,
-            query,
-            extra_settings,
-            params,
-            &client_info,
-        )
-        .await?;
-        writer::send_empty_block(&mut self.writer, revision).await
+        let writer = &mut self.writer;
+        let write = async {
+            writer::send_query(
+                writer,
+                revision,
+                query_id,
+                query,
+                extra_settings,
+                params,
+                &client_info,
+            )
+            .await?;
+            writer::send_empty_block(writer, revision).await
+        };
+        bounded_io(self.read_timeout, write).await
     }
 
     /// Send a Ping and wait for the Pong. Stray Progress / Log /
@@ -696,9 +700,11 @@ impl ConnectionActor {
     /// surfaces as `Error::ServerException`. Reader sub-task exit or
     /// any I/O error poisons the connection.
     async fn do_ping(&mut self) -> Result<()> {
-        writer::send_ping(&mut self.writer).await.inspect_err(|_| {
-            self.poisoned.store(true, Ordering::Release);
-        })?;
+        bounded_io(self.read_timeout, writer::send_ping(&mut self.writer))
+            .await
+            .inspect_err(|_| {
+                self.poisoned.store(true, Ordering::Release);
+            })?;
         loop {
             let msg = match self.next_packet().await {
                 PacketWait::Idle => match self.idle_timed_out() {
@@ -825,8 +831,13 @@ impl ConnectionActor {
     /// Send a protocol Cancel and drain to EndOfStream so the next
     /// caller starts on a clean stream pointer. `reason` names the
     /// trigger in the warning a failure logs.
+    ///
+    /// The Cancel write is bounded too, by the I/O deadline or else by
+    /// [`DRAIN_TIMEOUT`], so a peer that stopped reading cannot hold the
+    /// actor before the drain's own bound starts.
     async fn cancel_and_drain(&mut self, reason: &str) {
-        if let Err(e) = writer::send_cancel(&mut self.writer).await {
+        let limit = self.read_timeout.unwrap_or(DRAIN_TIMEOUT);
+        if let Err(e) = bounded_io(Some(limit), writer::send_cancel(&mut self.writer)).await {
             self.poisoned.store(true, Ordering::Release);
             tracing::warn!(
                 target: "clickhouse::tcp",
@@ -1651,6 +1662,33 @@ mod tests {
         assert!(
             !handle.is_alive(),
             "a half-written frame poisons the connection"
+        );
+        drop(server);
+    }
+
+    /// The Query packet and its terminator are writes like any other: a peer
+    /// that stops reading must not park the actor past `read_timeout`.
+    #[tokio::test]
+    async fn a_query_write_that_outlasts_read_timeout_times_out_and_poisons() {
+        let (handle, server) = paired_with_config(ActorConfig {
+            read_timeout: Some(Duration::from_millis(300)),
+            ..ActorConfig::default()
+        })
+        .await;
+
+        // Far past any loopback socket buffer, and the server never reads.
+        let query = format!("SELECT '{}'", "x".repeat(64 * 1024 * 1024));
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            handle.execute_query("q_stall".into(), query, Vec::new(), Vec::new()),
+        )
+        .await
+        .expect("the write must stop at read_timeout, not wait on the peer")
+        .expect_err("a stalled write is an error");
+        assert!(matches!(err, Error::TimedOut), "got {err:?}");
+        assert!(
+            !handle.is_alive(),
+            "a half-written query poisons the connection"
         );
         drop(server);
     }
