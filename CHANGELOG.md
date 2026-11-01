@@ -3,6 +3,12 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [0.1.8](https://github.com/hyperi-io/dfe-clickhouse-rs/compare/v0.1.7...v0.1.8) (2026-11-01)
+
+### Bug Fixes
+
+* manual remediation of LLM auto fixes -- keep defaults and nullable strings right on insert ([#39](https://github.com/hyperi-io/dfe-clickhouse-rs/issues/39)) ([4ebd47b](https://github.com/hyperi-io/dfe-clickhouse-rs/commit/4ebd47b95a4e1906fac83ce22f7a90c406f5ec45))
+
 ## [0.1.7](https://github.com/hyperi-io/dfe-clickhouse-rs/compare/v0.1.6...v0.1.7) (2026-11-01)
 
 ### Bug Fixes
