@@ -114,5 +114,7 @@ Sparse are decoded; the rest are refused by name.
 `Polygon`, `MultiPolygon`.
 
 A runtime-schema insert also refuses `Tuple`, `Variant` and `Dynamic`. It
-takes a `Point` as an `[x, y]` pair or a `{"lat", "lon"}` object, with
-longitude as x.
+takes a `Point` in any form Elasticsearch takes a `geo_point`: `[lon, lat]`,
+`{"lat", "lon"}`, a GeoJSON point, `"lat,lon"` or WKT `POINT (lon lat)`, with
+longitude as x. A latitude past 90 or a longitude past 180 is refused, and so
+is a geohash.

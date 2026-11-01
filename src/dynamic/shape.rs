@@ -149,6 +149,135 @@ fn wrap_json_text(key: &str, json: &str) -> Vec<u8> {
     out
 }
 
+/// Read a geo point as `(longitude, latitude)` from any form Elasticsearch
+/// takes for a `geo_point`: `{"lat": n, "lon": n}`, a GeoJSON point,
+/// `"lat,lon"`, `[lon, lat]`, or WKT `POINT (lon lat)`. A third coordinate is
+/// read and ignored, as Elasticsearch ignores it.
+///
+/// The messages name neither the value nor its coordinates, which are
+/// customer data.
+pub(crate) fn geo_point_lon_lat(value: &Value) -> Result<(f64, f64), &'static str> {
+    let (lon, lat) = match value {
+        Value::Object(fields) => point_from_object(fields)?,
+        Value::Array(coordinates) => point_from_coordinates(coordinates)?,
+        Value::String(text) => point_from_text(text)?,
+        Value::Null | Value::Bool(_) | Value::Number(_) => {
+            return Err("geo_point must be an object, a string or an array");
+        }
+    };
+    if !(-90.0..=90.0).contains(&lat) {
+        return Err("geo_point latitude is outside -90 to 90");
+    }
+    if !(-180.0..=180.0).contains(&lon) {
+        return Err("geo_point longitude is outside -180 to 180");
+    }
+    Ok((lon, lat))
+}
+
+/// `{"lat": n, "lon": n}`, or a GeoJSON `{"type": "Point", "coordinates": [lon, lat]}`.
+fn point_from_object(fields: &Map<String, Value>) -> Result<(f64, f64), &'static str> {
+    if let (Some(lat), Some(lon)) = (fields.get("lat"), fields.get("lon")) {
+        return Ok((coordinate(lon)?, coordinate(lat)?));
+    }
+    let geojson_point = fields
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|t| t.eq_ignore_ascii_case("point"));
+    match fields.get("coordinates") {
+        Some(Value::Array(coordinates)) if geojson_point => point_from_coordinates(coordinates),
+        _ => Err("geo_point object needs lat and lon"),
+    }
+}
+
+/// `[lon, lat]` or `[lon, lat, z]` -- GeoJSON order, longitude first.
+fn point_from_coordinates(coordinates: &[Value]) -> Result<(f64, f64), &'static str> {
+    match coordinates {
+        [lon, lat] | [lon, lat, _] => Ok((coordinate(lon)?, coordinate(lat)?)),
+        _ => Err("geo_point array must be [lon, lat]"),
+    }
+}
+
+/// `"lat,lon"` (latitude first) or WKT `POINT (lon lat)`. A geohash has no
+/// decoder here and is refused by name.
+fn point_from_text(text: &str) -> Result<(f64, f64), &'static str> {
+    let text = text.trim();
+    if let Some(keyword) = text.get(..5)
+        && keyword.eq_ignore_ascii_case("point")
+    {
+        return point_from_wkt(&text[5..]);
+    }
+    let mut parts = text.split(',');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(lat), Some(lon), _, None) => Ok((text_coordinate(lon)?, text_coordinate(lat)?)),
+        (Some(word), None, _, _) if is_geohash(word) => Err("geohash geo_points are not supported"),
+        _ => Err("geo_point string must be \"lat,lon\" or WKT POINT (lon lat)"),
+    }
+}
+
+/// The body of a WKT point after its `POINT` keyword: an optional `Z`/`M`/`ZM`
+/// tag, then `(lon lat)` with an optional third ordinate.
+fn point_from_wkt(body: &str) -> Result<(f64, f64), &'static str> {
+    const WKT: &str = "geo_point WKT must read POINT (lon lat)";
+    let body = body.trim_start();
+    let body = ["ZM", "Z", "M"]
+        .iter()
+        .find_map(|tag| {
+            body.get(..tag.len())
+                .filter(|head| head.eq_ignore_ascii_case(tag))
+                .map(|_| body[tag.len()..].trim_start())
+        })
+        .unwrap_or(body);
+    let inner = body
+        .strip_prefix('(')
+        .and_then(|rest| rest.trim_end().strip_suffix(')'))
+        .ok_or(WKT)?;
+    let mut ordinates = inner.split_ascii_whitespace();
+    match (
+        ordinates.next(),
+        ordinates.next(),
+        ordinates.next(),
+        ordinates.next(),
+    ) {
+        (Some(lon), Some(lat), _, None) => Ok((text_coordinate(lon)?, text_coordinate(lat)?)),
+        _ => Err(WKT),
+    }
+}
+
+/// One coordinate from a JSON number or a numeric string, refused unless finite.
+fn coordinate(value: &Value) -> Result<f64, &'static str> {
+    match value {
+        Value::Number(n) => n
+            .as_f64()
+            .filter(|f| f.is_finite())
+            .ok_or("geo_point coordinate is not a finite number"),
+        Value::String(s) => text_coordinate(s),
+        _ => Err("geo_point coordinate is not a number"),
+    }
+}
+
+/// One coordinate from text, refused unless it reads as a finite number.
+fn text_coordinate(text: &str) -> Result<f64, &'static str> {
+    text.trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|f| f.is_finite())
+        .ok_or("geo_point coordinate is not a finite number")
+}
+
+/// Whether a word reads as a geohash: 1 to 12 characters of its base-32
+/// alphabet, which leaves out `a`, `i`, `l` and `o`.
+fn is_geohash(word: &str) -> bool {
+    (1..=12).contains(&word.len()) && word.bytes().all(is_geohash_digit)
+}
+
+/// One character of the geohash base-32 alphabet, in either case.
+fn is_geohash_digit(byte: u8) -> bool {
+    matches!(
+        byte.to_ascii_lowercase(),
+        b'0'..=b'9' | b'b'..=b'h' | b'j' | b'k' | b'm' | b'n' | b'p'..=b'z'
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,6 +328,45 @@ mod tests {
             let mut shaped_now = value.clone();
             shape_json_value(&mut shaped_now);
             assert_eq!(shaped_now, shaped, "{value}");
+        }
+    }
+
+    #[test]
+    fn every_geo_point_form_reads_as_lon_then_lat() {
+        for value in [
+            json!({"lat": 41.12, "lon": -71.34}),
+            json!({"lat": "41.12", "lon": "-71.34"}),
+            json!({"type": "Point", "coordinates": [-71.34, 41.12]}),
+            json!([-71.34, 41.12]),
+            json!([-71.34, 41.12, 9.0]),
+            json!("41.12,-71.34"),
+            json!(" 41.12 , -71.34 "),
+            json!("41.12,-71.34,9"),
+            json!("POINT (-71.34 41.12)"),
+            json!("point z (-71.34 41.12 9)"),
+        ] {
+            assert_eq!(geo_point_lon_lat(&value), Ok((-71.34, 41.12)), "{value}");
+        }
+    }
+
+    #[test]
+    fn a_geo_point_out_of_range_or_malformed_is_refused() {
+        for value in [
+            json!({"lat": 100, "lon": 0}),
+            json!({"lat": 0, "lon": 200}),
+            json!([200, 0]),
+            json!("91,0"),
+            json!({"lat": 1}),
+            json!({"type": "LineString", "coordinates": [0, 0]}),
+            json!([1]),
+            json!("drm3btev3e86"),
+            json!("POINT (1)"),
+            json!("1,2,3,4"),
+            json!(42),
+            json!(null),
+            json!([f64::MAX, "NaN"]),
+        ] {
+            assert!(geo_point_lon_lat(&value).is_err(), "{value}");
         }
     }
 

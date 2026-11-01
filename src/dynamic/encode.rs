@@ -38,7 +38,7 @@ use crate::native::io::ClickHouseBytesWrite;
 use super::datetime::{self, civil_days_from_epoch, days_in_month};
 use super::error::DynamicError;
 use super::parsed_type::{ParsedType, TypeTag};
-use super::shape::json_column_text;
+use super::shape::{geo_point_lon_lat, json_column_text};
 
 /// A single resolved column for a dynamic insert.
 #[derive(Debug, Clone)]
@@ -405,24 +405,13 @@ fn encode_typed(
     Ok(())
 }
 
-/// A `Point` as `RowBinary`: x then y, each a little-endian `Float64`.
-///
-/// Takes a `[x, y]` pair, the GeoJSON order, or the `{"lat", "lon"}` object an
-/// Elastic `geo_point` carries, with longitude as x.
+/// A `Point` as `RowBinary`: x then y, each a little-endian `Float64`, with
+/// longitude as x. Any form [`geo_point_lon_lat`] reads, inside the
+/// coordinate ranges.
 fn encode_point(value: &Value, col: &str, buf: &mut Vec<u8>) -> Result<(), DynamicError> {
-    let (x, y) = match value {
-        Value::Array(pair) => match pair.as_slice() {
-            [x, y] => (x, y),
-            _ => return Err(enc_err(col, "Point needs exactly two coordinates")),
-        },
-        Value::Object(obj) => match (obj.get("lon"), obj.get("lat")) {
-            (Some(lon), Some(lat)) => (lon, lat),
-            _ => return Err(enc_err(col, "Point object needs both lat and lon")),
-        },
-        _ => return Err(enc_err(col, "Point needs [x, y] or {lat, lon}")),
-    };
-    buf.extend_from_slice(&as_f64(x, col)?.to_le_bytes());
-    buf.extend_from_slice(&as_f64(y, col)?.to_le_bytes());
+    let (lon, lat) = geo_point_lon_lat(value).map_err(|m| enc_err(col, m))?;
+    buf.extend_from_slice(&lon.to_le_bytes());
+    buf.extend_from_slice(&lat.to_le_bytes());
     Ok(())
 }
 
@@ -1576,13 +1565,15 @@ mod tests {
     }
 
     #[test]
-    fn point_refuses_anything_that_is_not_two_coordinates() {
+    fn point_refuses_anything_that_is_not_a_point_in_range() {
         for value in [
             json!([1.0]),
-            json!([1.0, 2.0, 3.0]),
+            json!([1.0, 2.0, 3.0, 4.0]),
             json!(["a", 2.0]),
             json!({"lat": 1.0}),
-            json!("POINT(1 2)"),
+            json!({"lat": 100, "lon": 0}),
+            json!([200, 0]),
+            json!("POINT(1)"),
             json!(7),
         ] {
             let err = enc_err_of(json!({ "p": value }), &[("p", "Point")]);
