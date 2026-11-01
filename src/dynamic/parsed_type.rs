@@ -239,6 +239,18 @@ impl ParsedType {
             break;
         }
 
+        // SimpleAggregateFunction(f, T) is T on the wire. The raw text, which
+        // the Native header declares, stays as the server reported it.
+        if let Some(args) = Self::extract_wrapper(&type_str, "SimpleAggregateFunction")
+            && let Some((_, inner)) = Self::split_type_args(&args)
+        {
+            let mut parsed = Self::parse(&inner);
+            parsed.raw = result.raw;
+            parsed.nullable |= result.nullable;
+            parsed.low_cardinality |= result.low_cardinality;
+            return parsed;
+        }
+
         // Typed paths included: an insert sends JSON as text on both transports.
         if let Some(args) = Self::extract_wrapper(&type_str, "JSON") {
             result.base = "JSON".to_string();
@@ -719,6 +731,20 @@ mod tests {
     fn test_display() {
         let t = ParsedType::parse("LowCardinality(Nullable(String))");
         assert_eq!(t.to_string(), "LowCardinality(Nullable(String))");
+    }
+
+    /// The wrapper is the inner type on the wire, so the parse is the inner
+    /// type's, with the raw text kept for the block header.
+    #[test]
+    fn a_simple_aggregate_function_parses_as_its_inner_type() {
+        let t = ParsedType::parse("SimpleAggregateFunction(sum, UInt64)");
+        assert_eq!(t.tag, TypeTag::UInt64);
+        assert_eq!(t.raw, "SimpleAggregateFunction(sum, UInt64)");
+        let t = ParsedType::parse("SimpleAggregateFunction(anyLast, Nullable(String))");
+        assert_eq!(t.tag, TypeTag::String);
+        assert!(t.nullable);
+        let t = ParsedType::parse("SimpleAggregateFunction(groupUniqArrayArray, Array(UInt32))");
+        assert_eq!(t.tag, TypeTag::Array);
     }
 
     #[test]

@@ -371,6 +371,10 @@ fn write_col_values(values: &[&[u8]], col_type: &ColumnType, out: &mut Vec<u8>) 
             }
         }
 
+        // The wrapper names the server's merge function and is its inner
+        // type on the wire, in both RowBinary and Native.
+        ColumnType::SimpleAggregateFunction(inner) => write_col_values(values, inner, out)?,
+
         ColumnType::Point => {
             // Native: `Tuple(Float64, Float64)`, so every x, then every y.
             for half in [0..POINT_HALF, POINT_HALF..POINT_BYTES] {
@@ -446,6 +450,7 @@ fn rb_advance(data: &[u8], pos: &mut usize, col_type: &ColumnType) -> Result<()>
             // RowBinary serialises LowCardinality transparently as the inner type.
             rb_advance(data, pos, inner)?;
         }
+        ColumnType::SimpleAggregateFunction(inner) => rb_advance(data, pos, inner)?,
         ColumnType::Array(inner) => {
             let (count, hdr) = rb_read_varuint(data, *pos)?;
             *pos += hdr;
@@ -494,7 +499,7 @@ fn rb_write_default(out: &mut Vec<u8>, col_type: &ColumnType) {
         ColumnType::Point => {
             out.extend(std::iter::repeat_n(0u8, POINT_BYTES));
         }
-        ColumnType::LowCardinality(inner) => {
+        ColumnType::LowCardinality(inner) | ColumnType::SimpleAggregateFunction(inner) => {
             rb_write_default(out, inner);
         }
         _ => {
@@ -709,6 +714,29 @@ mod tests {
             body(&out, "Tuple(UInt8, UInt16)"),
             vec![1, 3, /* u16s */ 2, 0, 4, 0]
         );
+    }
+
+    /// `SimpleAggregateFunction(f, T)` is `T` on the wire, inside a
+    /// `Nullable` and an `Array` too.
+    #[test]
+    fn encode_simple_aggregate_function_as_its_inner_type() {
+        let rows = vec![7u64.to_le_bytes().to_vec(), 9u64.to_le_bytes().to_vec()];
+        let ty = "SimpleAggregateFunction(sum, UInt64)";
+        let out = encode_columns(&rows, &schema(ty), 0).expect("encodes");
+        assert_eq!(
+            body(&out, ty),
+            [7u64.to_le_bytes(), 9u64.to_le_bytes()].concat()
+        );
+
+        let ty = "SimpleAggregateFunction(groupArrayArray, Array(String))";
+        let rows = vec![vec![1u8, 1, b'a'], vec![0u8]];
+        let out = encode_columns(&rows, &schema(ty), 0).expect("encodes");
+        // Offsets (1, 1), then the one string.
+        let mut want = Vec::new();
+        want.extend_from_slice(&1u64.to_le_bytes());
+        want.extend_from_slice(&1u64.to_le_bytes());
+        want.extend_from_slice(&[1, b'a']);
+        assert_eq!(body(&out, ty), want);
     }
 
     #[test]

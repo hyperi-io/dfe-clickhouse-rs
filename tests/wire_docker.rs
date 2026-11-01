@@ -2296,6 +2296,20 @@ const COERCIONS: &[Coercion] = &[
         &["off"],
     ),
     lands(
+        "SimpleAggregateFunction(sum, UInt64)",
+        "v SimpleAggregateFunction(sum, UInt64)",
+        &[r#"{"v": 5}"#],
+        "toString(v)",
+        &["5"],
+    ),
+    lands(
+        "SimpleAggregateFunction over an Array",
+        "v SimpleAggregateFunction(groupArrayArray, Array(String))",
+        &[r#"{"v": ["a", "b"]}"#],
+        "toString(v)",
+        &["['a','b']"],
+    ),
+    lands(
         "Enum16 by number",
         "v Enum16('x' = 1000, 'y' = 2000)",
         &[r#"{"v": 2000}"#],
