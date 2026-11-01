@@ -261,6 +261,10 @@ fn fetch_failed(full_table: &str, source: crate::Error) -> DynamicError {
     }
 }
 
+/// The most tables a [`DynamicSchemaCache`] holds. Past it the oldest entry
+/// makes room, so a caller writing to ever-new table names stays bounded.
+pub const MAX_CACHED_TABLES: usize = 10_000;
+
 /// TTL-based schema cache, safe to share across insert tasks via `Arc`.
 ///
 /// A `std::sync::RwLock` and not an async one: a lookup is one hash probe per
@@ -277,6 +281,18 @@ struct CacheEntry {
 }
 
 impl DynamicSchemaCache {
+    /// Number of tables held, fresh or not yet dropped.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner.read().map_or(0, |g| g.len())
+    }
+
+    /// Whether the cache holds no tables.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// How long a fetched schema is served before it is fetched again.
     #[must_use]
     pub fn ttl(&self) -> Duration {
@@ -308,9 +324,20 @@ impl DynamicSchemaCache {
         })
     }
 
-    /// Insert or refresh a table's schema.
+    /// Insert or refresh a table's schema. Expired entries are dropped here,
+    /// and the oldest entry makes room once [`MAX_CACHED_TABLES`] are held.
     pub fn insert(&self, table: &str, schema: Arc<DynamicSchema>) {
         if let Ok(mut guard) = self.inner.write() {
+            guard.retain(|_, e| e.fetched_at.elapsed() < self.ttl);
+            if guard.len() >= MAX_CACHED_TABLES
+                && !guard.contains_key(table)
+                && let Some(oldest) = guard
+                    .iter()
+                    .min_by_key(|(_, e)| e.fetched_at)
+                    .map(|(name, _)| name.clone())
+            {
+                guard.remove(&oldest);
+            }
             guard.insert(
                 table.to_string(),
                 CacheEntry {
@@ -440,6 +467,30 @@ mod tests {
         assert!(cache.get("db.t").is_some(), "still inside the TTL");
         tokio::time::advance(Duration::from_secs(2)).await;
         assert!(cache.get("db.t").is_none(), "past the TTL");
+    }
+
+    /// An expired entry is gone once anything is written, so a caller seeing
+    /// ever-new table names does not keep every schema it ever read, and the
+    /// cache holds at most its capacity, oldest out first.
+    #[tokio::test(start_paused = true)]
+    async fn the_cache_drops_expired_entries_and_holds_its_capacity() {
+        let cache = DynamicSchemaCache::new(Duration::from_secs(1));
+        cache.insert("db.old", shared("db.old", vec![col("id", "UInt64", "")]));
+        tokio::time::advance(Duration::from_secs(2)).await;
+        cache.insert("db.new", shared("db.new", vec![col("id", "UInt64", "")]));
+        assert_eq!(cache.len(), 1, "the expired entry went on the next write");
+
+        let cache = DynamicSchemaCache::new(Duration::from_secs(300));
+        for i in 0..=MAX_CACHED_TABLES {
+            cache.insert(
+                &format!("db.t{i}"),
+                shared("db.t", vec![col("id", "UInt64", "")]),
+            );
+            tokio::time::advance(Duration::from_millis(1)).await;
+        }
+        assert_eq!(cache.len(), MAX_CACHED_TABLES);
+        assert!(cache.get("db.t0").is_none(), "the oldest entry made room");
+        assert!(cache.get(&format!("db.t{MAX_CACHED_TABLES}")).is_some());
     }
 
     #[test]

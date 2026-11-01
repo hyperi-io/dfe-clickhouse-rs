@@ -34,7 +34,7 @@ pub use insert::{DynamicInsert, InsertTimeouts, SchemaRefresh};
 pub use parsed_type::{ParsedType, TypeTag};
 #[cfg(feature = "tcp")]
 pub use schema::fetch_dynamic_schema_tcp;
-pub use schema::{DynamicSchema, DynamicSchemaCache, fetch_dynamic_schema};
+pub use schema::{DynamicSchema, DynamicSchemaCache, MAX_CACHED_TABLES, fetch_dynamic_schema};
 pub use shape::{
     JSON_ARRAY_WRAPPER_KEY, JSON_SCALAR_WRAPPER_KEY, needs_shaping, shape_for_type,
     shape_json_value, shaping_changes,
