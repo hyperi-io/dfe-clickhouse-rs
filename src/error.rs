@@ -365,7 +365,7 @@ mod tests {
             },
             DynamicError::SchemaFetch {
                 table: "db.t".into(),
-                source: clickhouse::error::Error::TimedOut,
+                source: Box::new(Error::TimedOut),
             },
             DynamicError::Transport {
                 table: "db.t".into(),
@@ -400,7 +400,7 @@ mod tests {
 
         let err = Error::from(crate::dynamic::DynamicError::SchemaFetch {
             table: "db.t".into(),
-            source: clickhouse::error::Error::TimedOut,
+            source: Box::new(Error::TimedOut),
         });
         assert_eq!(
             err.to_string(),

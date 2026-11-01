@@ -49,9 +49,11 @@ pub enum DynamicError {
     SchemaFetch {
         /// Fully qualified `database.table`.
         table: String,
-        /// The query failure, kept typed so a caller can classify it.
+        /// The query failure on either transport, kept typed so a caller can
+        /// classify it, and boxed because [`crate::Error`] holds a
+        /// [`DynamicError`].
         #[source]
-        source: clickhouse::error::Error,
+        source: Box<crate::Error>,
     },
     /// Table has no columns (or does not exist). Retriable against a cluster
     /// that is still replicating the DDL.
@@ -87,6 +89,17 @@ impl DynamicError {
                 | Self::SchemaFetch { .. }
                 | Self::SchemaMismatch { .. }
                 | Self::EmptySchema { .. }
+        )
+    }
+
+    /// Whether the schema read or the insert ran past its client-side bound,
+    /// for a caller that widens the bound on the next attempt.
+    #[must_use]
+    pub fn is_timed_out(&self) -> bool {
+        matches!(
+            self,
+            Self::SchemaFetch { source, .. } | Self::Transport { source, .. }
+                if matches!(**source, crate::Error::TimedOut)
         )
     }
 }

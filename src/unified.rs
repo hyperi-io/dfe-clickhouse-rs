@@ -153,8 +153,7 @@ impl UnifiedClient {
         table: &str,
         cache: std::sync::Arc<crate::dynamic::DynamicSchemaCache>,
     ) -> Result<crate::dynamic::DynamicInsert> {
-        use crate::dynamic::DynamicInsert;
-        use crate::dynamic::schema::{schema_from_system_columns, system_columns_sql};
+        use crate::dynamic::{DynamicInsert, fetch_dynamic_schema_tcp};
 
         // Two arms, one of which returns: `if let` would have to name the
         // other arm's binding a second time to reach the TCP client.
@@ -170,16 +169,9 @@ impl UnifiedClient {
         let schema = if let Some(cached) = cache.get(&full) {
             cached
         } else {
-            let columns = self
-                .fetch_columns(&system_columns_sql(database, table))
-                .await?;
-            let rows = columns
-                .get::<String>("name")?
-                .into_iter()
-                .zip(columns.get::<String>("col_type")?)
-                .zip(columns.get::<String>("default_kind")?)
-                .map(|((name, col_type), kind)| (name, col_type, kind));
-            let fetched = schema_from_system_columns(full.clone(), rows)?;
+            // Boxed: a cold read only, and inline it would size every caller's
+            // future to match.
+            let fetched = Box::pin(fetch_dynamic_schema_tcp(client, database, table, None)).await?;
             cache.insert(&full, std::sync::Arc::clone(&fetched));
             fetched
         };

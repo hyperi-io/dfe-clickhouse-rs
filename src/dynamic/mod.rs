@@ -30,8 +30,10 @@ mod shape;
 
 pub use encode::{ColumnDef, DynamicRow};
 pub use error::DynamicError;
-pub use insert::DynamicInsert;
+pub use insert::{DynamicInsert, InsertTimeouts, SchemaRefresh};
 pub use parsed_type::{ParsedType, TypeTag};
+#[cfg(feature = "tcp")]
+pub use schema::fetch_dynamic_schema_tcp;
 pub use schema::{DynamicSchema, DynamicSchemaCache, fetch_dynamic_schema};
 pub use shape::{
     JSON_ARRAY_WRAPPER_KEY, JSON_SCALAR_WRAPPER_KEY, needs_shaping, shape_for_type,

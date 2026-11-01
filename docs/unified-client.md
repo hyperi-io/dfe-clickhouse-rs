@@ -56,3 +56,18 @@ and returns a `DynamicInsert` bound to it. The TCP arm resolves the schema
 eagerly, because `DynamicInsert::tcp` needs it up front; the HTTP arm defers.
 Encoding is RowBinaryWithDefaults for HTTP and Native columnar for TCP, sharing the
 encoder.
+
+A caller that holds its own client reads a schema with `fetch_dynamic_schema`
+(HTTP) or `fetch_dynamic_schema_tcp`, each under an optional bound, and opens
+the insert with `DynamicInsert::http` or `DynamicInsert::tcp`.
+`with_timeouts(InsertTimeouts::new(send, end))` bounds the schema read, each
+send and the server's final answer. A step past its bound fails retriable,
+and `DynamicError::is_timed_out` says so. `with_schema_refresh` keeps a cached
+schema through a mismatch until its TTL, for a caller that refreshes it
+itself. `schema()` hands back the shared schema the rows were encoded against,
+to compare with a fresh read (`DynamicSchema::same_columns`) once a rejection
+comes back.
+
+`shape_for_type` applies the encoder's value rules to a row map for a
+JSONEachRow body, for the columns `needs_shaping` names, so both formats store
+the same value.
