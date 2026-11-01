@@ -33,6 +33,11 @@ const MAX_BLOCK_ROWS: u64 = 1 << 28;
 /// Hard cap on the `num_columns` a Data packet header may declare.
 const MAX_BLOCK_COLUMNS: u64 = 1 << 16;
 
+/// Bytes a block's sparse columns may expand to, summed over them. A dense
+/// column is backed byte for byte by the wire, but a sparse one's defaults are
+/// not: a few bytes can declare 2^28 rows of `UInt256`, an 8 GiB zero fill.
+pub(crate) const MAX_SPARSE_EXPANSION_BYTES: usize = 1 << 30;
+
 /// Reject a length a server declared but cannot back with payload.
 fn refused(what: &str, got: u64, cap: u64) -> Error {
     Error::BadResponse(format!(
@@ -316,7 +321,12 @@ impl DecodedColumn {
     ///
     /// [`Error::BadResponse`] if a position is past `num_rows`, if the value
     /// count does not match the position count, or for a composite column.
-    pub(crate) fn expand_sparse(self, positions: &[usize], num_rows: usize) -> Result<Self> {
+    pub(crate) fn expand_sparse(
+        self,
+        positions: &[usize],
+        num_rows: usize,
+        budget: &mut usize,
+    ) -> Result<Self> {
         if self.row_count() != positions.len() {
             return Err(Error::BadResponse(format!(
                 "native: sparse column has {} values for {} positions",
@@ -332,7 +342,9 @@ impl DecodedColumn {
 
         macro_rules! scatter {
             ($variant:ident, $values:expr, $default:expr) => {
-                Self::$variant(scatter_values($values, positions, num_rows, $default)?)
+                Self::$variant(scatter_values(
+                    $values, positions, num_rows, $default, budget,
+                )?)
             };
         }
 
@@ -366,7 +378,7 @@ impl DecodedColumn {
             } => Self::Decimal32 {
                 precision,
                 scale,
-                values: scatter_values(values, positions, num_rows, 0i32)?,
+                values: scatter_values(values, positions, num_rows, 0i32, budget)?,
             },
             Self::Decimal64 {
                 precision,
@@ -375,7 +387,7 @@ impl DecodedColumn {
             } => Self::Decimal64 {
                 precision,
                 scale,
-                values: scatter_values(values, positions, num_rows, 0i64)?,
+                values: scatter_values(values, positions, num_rows, 0i64, budget)?,
             },
             Self::Decimal128 {
                 precision,
@@ -384,7 +396,7 @@ impl DecodedColumn {
             } => Self::Decimal128 {
                 precision,
                 scale,
-                values: scatter_values(values, positions, num_rows, 0i128)?,
+                values: scatter_values(values, positions, num_rows, 0i128, budget)?,
             },
             Self::Decimal256 {
                 precision,
@@ -393,7 +405,7 @@ impl DecodedColumn {
             } => Self::Decimal256 {
                 precision,
                 scale,
-                values: scatter_values(values, positions, num_rows, [0u8; 32])?,
+                values: scatter_values(values, positions, num_rows, [0u8; 32], budget)?,
             },
             Self::DateTime64 {
                 precision,
@@ -402,7 +414,7 @@ impl DecodedColumn {
             } => Self::DateTime64 {
                 precision,
                 timezone,
-                values: scatter_values(values, positions, num_rows, 0i64)?,
+                values: scatter_values(values, positions, num_rows, 0i64, budget)?,
             },
             Self::FixedString { width, bytes } => {
                 // Both factors are wire-derived, so the product is checked --
@@ -412,6 +424,7 @@ impl DecodedColumn {
                         "native: sparse FixedString byte length overflows usize".into(),
                     )
                 })?;
+                spend_sparse_budget(budget, total)?;
                 let mut out = with_cap(total)?;
                 out.resize(total, 0u8);
                 for (i, &row) in positions.iter().enumerate() {
@@ -453,7 +466,9 @@ fn scatter_values<T: Clone>(
     positions: &[usize],
     num_rows: usize,
     default: T,
+    budget: &mut usize,
 ) -> Result<Vec<T>> {
+    spend_sparse_budget(budget, num_rows.saturating_mul(std::mem::size_of::<T>()))?;
     // The reservation covers the full length, so `resize` cannot reallocate.
     let mut out = with_cap(num_rows)?;
     out.resize(num_rows, default);
@@ -461,6 +476,17 @@ fn scatter_values<T: Clone>(
         out[row] = value;
     }
     Ok(out)
+}
+
+/// Take `bytes` of sparse expansion from what the block has left, or refuse it.
+fn spend_sparse_budget(budget: &mut usize, bytes: usize) -> Result<()> {
+    *budget = budget.checked_sub(bytes).ok_or_else(|| {
+        Error::BadResponse(format!(
+            "native: sparse columns would expand past the {MAX_SPARSE_EXPANSION_BYTES}-byte \
+             per-block cap"
+        ))
+    })?;
+    Ok(())
 }
 
 /// A decoded Native data block: ordered list of columns plus the
@@ -813,6 +839,7 @@ pub(crate) async fn decode_block<R: ClickHouseRead>(
 
     let mut schema = with_cap(column_count)?;
     let mut columns = with_cap(column_count)?;
+    let mut sparse_budget = MAX_SPARSE_EXPANSION_BYTES;
 
     for _ in 0..num_columns {
         let name = r.read_utf8_string().await?;
@@ -844,7 +871,7 @@ pub(crate) async fn decode_block<R: ClickHouseRead>(
                     let dense = decode_column(r, &ct, present, server_revision, 0, &mut headers)
                         .await
                         .map_err(|e| name_the_column(&name, e))?;
-                    dense.expand_sparse(&positions, rows)?
+                    dense.expand_sparse(&positions, rows, &mut sparse_budget)?
                 } else {
                     decode_column(r, &ct, num_rows, server_revision, 0, &mut headers)
                         .await
@@ -1964,7 +1991,7 @@ mod tests {
     #[test]
     fn sparse_expansion_refuses_a_value_count_that_does_not_match() {
         let err = DecodedColumn::UInt8(vec![1, 2, 3])
-            .expand_sparse(&[0, 2], 4)
+            .expand_sparse(&[0, 2], 4, &mut MAX_SPARSE_EXPANSION_BYTES.clone())
             .unwrap_err();
         match err {
             Error::BadResponse(msg) => {
@@ -1979,7 +2006,7 @@ mod tests {
     #[test]
     fn sparse_expansion_refuses_a_position_past_the_block() {
         let err = DecodedColumn::UInt8(vec![7])
-            .expand_sparse(&[9], 4)
+            .expand_sparse(&[9], 4, &mut MAX_SPARSE_EXPANSION_BYTES.clone())
             .unwrap_err();
         match err {
             Error::BadResponse(msg) => {
@@ -1995,12 +2022,44 @@ mod tests {
     #[test]
     fn sparse_expansion_refuses_a_row_count_the_allocator_cannot_back() {
         let err = DecodedColumn::UInt64(vec![7])
-            .expand_sparse(&[0], usize::MAX / 4)
+            .expand_sparse(&[0], usize::MAX / 4, &mut usize::MAX.clone())
             .unwrap_err();
         match err {
             Error::BadResponse(msg) => assert!(msg.contains("column buffer"), "got: {msg}"),
             other => panic!("expected BadResponse, got {other:?}"),
         }
+    }
+
+    /// A sparse column's defaults are not backed by the wire, so a block's
+    /// expansion is capped across its columns: one 2^28-row `UInt256`
+    /// declaration would be an 8 GiB zero fill, and columns that fit alone
+    /// still share the cap.
+    #[test]
+    fn sparse_expansion_stops_at_the_per_block_budget() {
+        let mut budget = MAX_SPARSE_EXPANSION_BYTES;
+        let err = DecodedColumn::UInt256(Vec::new())
+            .expand_sparse(&[], 1 << 28, &mut budget)
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::BadResponse(m) if m.contains("per-block cap")),
+            "{err:?}"
+        );
+
+        // A small cap, so the shared spend shows without a large fill.
+        let mut budget = 1_024;
+        let rows = 64;
+        for _ in 0..2 {
+            DecodedColumn::UInt64(Vec::new())
+                .expand_sparse(&[], rows, &mut budget)
+                .expect("each half fits");
+        }
+        assert_eq!(budget, 0);
+        assert!(
+            DecodedColumn::UInt8(Vec::new())
+                .expand_sparse(&[], 1, &mut budget)
+                .is_err(),
+            "the third column finds the cap spent"
+        );
     }
 
     /// `num_rows` and `FixedString`'s width are both wire-derived, and the
@@ -2012,7 +2071,7 @@ mod tests {
             width: usize::MAX / 2 + 1,
             bytes: Vec::new(),
         }
-        .expand_sparse(&[], 2)
+        .expand_sparse(&[], 2, &mut usize::MAX.clone())
         .unwrap_err();
         match err {
             Error::BadResponse(msg) => assert!(msg.contains("overflows usize"), "got: {msg}"),
