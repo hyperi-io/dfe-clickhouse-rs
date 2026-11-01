@@ -168,8 +168,9 @@ impl Error {
     ///
     /// Returns `true` for errors that *might* succeed on retry --
     /// transport-level (`Network`, `TimedOut`, `Transient`, `Connect`),
-    /// a known set of transient server-side codes, and the dynamic-insert
-    /// failures that clear once the schema is re-read.
+    /// a known set of transient server-side codes, whether the code arrived
+    /// typed over TCP or as the `Code: N` head of an HTTP [`Error::BadResponse`],
+    /// and the dynamic-insert failures that clear once the schema is re-read.
     ///
     /// Returns `false` for everything else, including unknown server codes:
     /// a caller wanting a more aggressive retry should match on the variant.
@@ -182,6 +183,7 @@ impl Error {
             // here rather than on their message text.
             Self::Network(_) | Self::TimedOut | Self::Transient(_) | Self::Connect(_) => true,
             Self::ServerException { code, .. } => Self::is_retriable_code(*code),
+            Self::BadResponse(body) => bad_response_code(body).is_some_and(Self::is_retriable_code),
             // A stale, missing or unreadable schema is fixed by re-reading it;
             // an unsupported type or a bad value is not.
             #[cfg(feature = "dynamic")]
@@ -245,6 +247,16 @@ impl Error {
     }
 }
 
+/// The server code heading a `Code: N` body, the form upstream gives every HTTP
+/// rejection, whether or not a `. DB::Exception: ...` message follows it.
+pub(crate) fn bad_response_code(body: &str) -> Option<i32> {
+    let rest = body.trim_start().strip_prefix("Code: ")?;
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use crate::error::Error;
@@ -272,13 +284,23 @@ mod tests {
         assert_traits::<Error>();
     }
 
+    /// The same code classifies the same way however it arrived: typed over
+    /// TCP, as a full HTTP exception body, or as upstream's bare `Code: N`.
     #[test]
     fn is_retriable_classifies_known_transient_codes() {
-        let make = |code: i32| Error::ServerException {
-            code,
-            name: None,
-            message: String::new(),
-            stack_trace: None,
+        let forms = |code: i32| {
+            [
+                Error::ServerException {
+                    code,
+                    name: None,
+                    message: String::new(),
+                    stack_trace: None,
+                },
+                Error::BadResponse(format!(
+                    "Code: {code}. DB::Exception: rejected. (SOME_NAME) (version 26.3.21.7)"
+                )),
+                Error::BadResponse(format!("Code: {code}")),
+            ]
         };
 
         // Sampled from the retriable table -- known transient codes.
@@ -286,15 +308,21 @@ mod tests {
             159i32, 160, 202, 209, 210, 236, 241, 252, 279, 290, 319, 364, 384, 439, 473, 659, 904,
             999,
         ] {
-            assert!(make(code).is_retriable(), "code {code} should be retriable");
+            for e in forms(code) {
+                assert!(e.is_retriable(), "{e:?} should be retriable");
+            }
         }
 
         // Sampled known-not-retriable codes (auth, schema, parse).
         for &code in &[36i32, 60, 117, 192, 195, 469] {
-            assert!(
-                !make(code).is_retriable(),
-                "code {code} should NOT be retriable"
-            );
+            for e in forms(code) {
+                assert!(!e.is_retriable(), "{e:?} should NOT be retriable");
+            }
+        }
+
+        // A body that carries no code, or only looks like one, stays terminal.
+        for body in ["", "502 Bad Gateway", "Code: x", "Code: -1", "code: 241"] {
+            assert!(!Error::BadResponse(body.into()).is_retriable(), "{body:?}");
         }
     }
 

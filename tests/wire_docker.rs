@@ -1776,9 +1776,10 @@ const DFE_TYPES: &[DfeType] = &[
     reads("String", &[(r#""x""#, "x"), (r#""""#, "")]),
     reads("Nullable(String)", &[("null", "NULL"), (r#""x""#, "x")]),
     reads("LowCardinality(String)", &[(r#""lc""#, "lc")]),
+    // An empty string shares its bytes with the NULL slot's placeholder.
     reads(
         "LowCardinality(Nullable(String))",
-        &[("null", "NULL"), (r#""lc""#, "lc")],
+        &[("null", "NULL"), (r#""lc""#, "lc"), (r#""""#, "")],
     ),
     reads("Int32", &[("-2147483648", "-2147483648")]),
     reads("Int64", &[("-9223372036854775808", "-9223372036854775808")]),
@@ -2035,6 +2036,207 @@ async fn every_dfe_type_round_trips_through_the_dynamic_insert() {
         DFE_TYPES.len(),
         failures.join("\n")
     );
+}
+
+/// Write `rows` of `(n, d)` through the dynamic insert, leaving `d` out of the
+/// row map where it is `None`.
+async fn write_n_d(
+    client: &UnifiedClient,
+    table: &str,
+    rows: &[Option<&str>],
+) -> Result<u64, dfe_clickhouse::Error> {
+    use dfe_clickhouse::dynamic::DynamicSchemaCache;
+    use serde_json::{Map, Value};
+
+    let cache = DynamicSchemaCache::new(Duration::from_secs(60));
+    let mut insert = client.dynamic_insert("wire", table, cache).await?;
+    for (n, d) in (0u32..).zip(rows) {
+        let mut row = Map::new();
+        row.insert("n".to_string(), Value::from(n));
+        if let Some(d) = d {
+            row.insert("d".to_string(), Value::from(*d));
+        }
+        insert.write_map(&row).await?;
+    }
+    Ok(insert.end().await?)
+}
+
+/// A defaulted column takes the row's value where the row carries one and the
+/// server's default where it does not, whichever shape the first row has. Over
+/// HTTP the whole batch is still one INSERT.
+#[tokio::test]
+async fn a_defaulted_column_is_kept_or_defaulted_row_by_row() {
+    const ORDERS: [&[Option<&str>]; 2] = [
+        &[None, Some("given"), None],
+        &[Some("given"), None, Some("again")],
+    ];
+
+    require_docker!();
+    let _one = ONE_SERVER.acquire().await.unwrap();
+    let server = server().await;
+    let (tcp, http) = (server.tcp(), server.http());
+    tcp.execute("CREATE DATABASE IF NOT EXISTS wire")
+        .await
+        .unwrap();
+
+    // A client default that would make the server write the type's zero for a
+    // flagged column instead of its DEFAULT expression.
+    let http_defaults_off = UnifiedClient::Http(
+        Client::default()
+            .with_url(format!("http://{}:{}", server.host, server.http_port))
+            .with_setting("input_format_defaults_for_omitted_fields", "0"),
+    );
+
+    let mut failures = Vec::new();
+    for (name, client) in [
+        ("http", &http),
+        ("httpoff", &http_defaults_off),
+        ("tcp", &tcp),
+    ] {
+        for (i, rows) in ORDERS.iter().enumerate() {
+            let table = format!("defaults_{name}_{i}");
+            tcp.execute(&format!(
+                "CREATE OR REPLACE TABLE wire.{table} \
+                 (n UInt32, d String DEFAULT 'dflt') ENGINE = MergeTree ORDER BY n"
+            ))
+            .await
+            .unwrap();
+            match write_n_d(client, &table, rows).await {
+                Ok(3) => {}
+                other => failures.push(format!("{name} {rows:?} insert: {other:?}")),
+            }
+            let want: Vec<&str> = rows.iter().map(|d| d.unwrap_or("dflt")).collect();
+            let got = tcp
+                .fetch_columns(&format!("SELECT d FROM wire.{table} ORDER BY n"))
+                .await
+                .and_then(|c| c.get::<String>("d"));
+            if !got.as_ref().is_ok_and(|got| *got == want) {
+                failures.push(format!("{name} {rows:?} read {got:?}, wanted {want:?}"));
+            }
+        }
+    }
+
+    tcp.execute("SYSTEM FLUSH LOGS").await.unwrap();
+    for (name, i) in ["http", "httpoff"]
+        .into_iter()
+        .flat_map(|name| (0..ORDERS.len()).map(move |i| (name, i)))
+    {
+        let inserts = tcp
+            .fetch_columns(&format!(
+                "SELECT count() AS c FROM system.query_log WHERE type = 'QueryFinish' \
+                 AND query LIKE 'INSERT INTO `wire`.`defaults_{name}_{i}`%'"
+            ))
+            .await
+            .and_then(|c| c.get::<u64>("c"));
+        if !inserts.as_ref().is_ok_and(|c| *c == [1]) {
+            failures.push(format!(
+                "{name} order {i}: INSERT count {inserts:?}, wanted 1"
+            ));
+        }
+    }
+
+    server.stop().await;
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// An HTTP dynamic insert sends its rows as it goes: the server is running the
+/// INSERT while rows are still being written, so the batch is never held whole.
+#[tokio::test]
+async fn an_http_dynamic_insert_streams_before_it_ends() {
+    use dfe_clickhouse::dynamic::DynamicSchemaCache;
+    use serde_json::{Map, Value};
+
+    const ROWS: u32 = 64;
+    const RUNNING: &str = "SELECT count() AS c FROM system.processes \
+                           WHERE query LIKE 'INSERT INTO `wire`.`streamed`%'";
+
+    require_docker!();
+    let _one = ONE_SERVER.acquire().await.unwrap();
+    let server = server().await;
+    let (tcp, http) = (server.tcp(), server.http());
+    tcp.execute("CREATE DATABASE IF NOT EXISTS wire")
+        .await
+        .unwrap();
+    tcp.execute(
+        "CREATE OR REPLACE TABLE wire.streamed (n UInt32, s String) \
+         ENGINE = MergeTree ORDER BY n",
+    )
+    .await
+    .unwrap();
+
+    // 64 rows of 64 KiB: 4 MiB, several flushes past any sane buffer.
+    let wide = "x".repeat(64 * 1024);
+    let cache = DynamicSchemaCache::new(Duration::from_secs(60));
+    let mut insert = http
+        .dynamic_insert("wire", "streamed", cache)
+        .await
+        .unwrap();
+    for n in 0..ROWS {
+        let mut row = Map::new();
+        row.insert("n".to_string(), Value::from(n));
+        row.insert("s".to_string(), Value::from(wide.as_str()));
+        insert.write_map(&row).await.unwrap();
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut running = 0;
+    while running == 0 && tokio::time::Instant::now() < deadline {
+        running = tcp
+            .fetch_columns(RUNNING)
+            .await
+            .and_then(|c| c.get::<u64>("c"))
+            .unwrap()[0];
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let written = insert.end().await;
+    let stored = tcp
+        .fetch_columns("SELECT count() AS c FROM wire.streamed")
+        .await
+        .and_then(|c| c.get::<u64>("c"));
+    server.stop().await;
+
+    assert!(
+        running > 0,
+        "no INSERT reached the server before end(): the whole batch sat in memory"
+    );
+    assert_eq!(written.unwrap(), u64::from(ROWS));
+    assert_eq!(stored.unwrap(), [u64::from(ROWS)]);
+}
+
+/// A transient server rejection stays retriable on both transports. A table
+/// capped at one part answers its second insert with code 252, `TOO_MANY_PARTS`.
+#[tokio::test]
+async fn a_transient_server_rejection_is_retriable_on_both_transports() {
+    require_docker!();
+    let _one = ONE_SERVER.acquire().await.unwrap();
+    let server = server().await;
+    let (tcp, http) = (server.tcp(), server.http());
+    tcp.execute("CREATE DATABASE IF NOT EXISTS wire")
+        .await
+        .unwrap();
+
+    let mut failures = Vec::new();
+    for (name, client) in [("http", &http), ("tcp", &tcp)] {
+        let table = format!("one_part_{name}");
+        tcp.execute(&format!(
+            "CREATE OR REPLACE TABLE wire.{table} (n UInt32, d String) \
+             ENGINE = MergeTree ORDER BY n \
+             SETTINGS parts_to_delay_insert = 1, parts_to_throw_insert = 1"
+        ))
+        .await
+        .unwrap();
+        if let Err(e) = write_n_d(client, &table, &[Some("first")]).await {
+            failures.push(format!("{name} first insert: {e}"));
+            continue;
+        }
+        match write_n_d(client, &table, &[Some("second")]).await {
+            Err(e) if e.is_retriable() && e.to_string().contains("252") => {}
+            other => failures.push(format!("{name} second insert: {other:?}")),
+        }
+    }
+
+    server.stop().await;
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// A failover list must verify each endpoint against its own host. The

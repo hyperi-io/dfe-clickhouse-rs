@@ -153,6 +153,25 @@ impl<'a> DynamicRow<'a> {
         Ok(())
     }
 
+    /// Append this row's `RowBinaryWithDefaults` bytes to `buf`: each column is
+    /// prefixed `1` to take the server's default, when the column has one and
+    /// the row does not carry it, or `0` and its RowBinary value otherwise.
+    ///
+    /// On error `buf` holds a partial row, as for [`Self::encode_into`].
+    pub(crate) fn encode_with_defaults_into(&self, buf: &mut Vec<u8>) -> Result<(), DynamicError> {
+        for col in self.columns {
+            let supplied = self.row.contains_key(&col.name)
+                || self.raw.is_some_and(|(name, _)| name == col.name);
+            if col.has_default && !supplied {
+                buf.push(1);
+            } else {
+                buf.push(0);
+                self.encode_column(col, buf)?;
+            }
+        }
+        Ok(())
+    }
+
     /// [`Self::encode_into`] into a fresh `Vec`.
     ///
     /// # Errors
@@ -2099,6 +2118,40 @@ mod tests {
 
     /// The batching primitive: N rows into one buffer are byte-identical to N
     /// separate `encode()` calls concatenated.
+    #[test]
+    fn with_defaults_flags_only_an_omitted_defaulted_column() {
+        let columns = [
+            ColumnDef::new("id", "UInt32"),
+            ColumnDef::with_default_kind("d", "String", "DEFAULT"),
+            ColumnDef::with_default_kind("j", "String", "DEFAULT"),
+        ];
+        // (row, raw `j`, bytes): a required column absent from the row still
+        // writes its value, and a raw passthrough counts as supplied.
+        let cases: [(serde_json::Value, Option<&[u8]>, &[u8]); 3] = [
+            (
+                json!({"id": 1, "d": "x"}),
+                None,
+                &[0, 1, 0, 0, 0, 0, 1, b'x', 1],
+            ),
+            (json!({"id": 1}), None, &[0, 1, 0, 0, 0, 1, 1]),
+            (
+                json!({}),
+                Some(b"{}"),
+                &[0, 0, 0, 0, 0, 1, 0, 2, b'{', b'}'],
+            ),
+        ];
+        for (row, raw, want) in cases {
+            let obj = row.as_object().unwrap().clone();
+            let encoder = match raw {
+                Some(bytes) => DynamicRow::with_raw(&obj, &columns, bytes, "j"),
+                None => DynamicRow::new(&obj, &columns),
+            };
+            let mut buf = Vec::new();
+            encoder.encode_with_defaults_into(&mut buf).unwrap();
+            assert_eq!(buf, want, "{row}");
+        }
+    }
+
     #[test]
     fn encode_into_appends_without_disturbing_earlier_rows() {
         let columns = [
