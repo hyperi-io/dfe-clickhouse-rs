@@ -104,30 +104,76 @@ pub struct TcpConnectionManager {
     /// caller-side cancellation.
     pub read_timeout: Option<Duration>,
     /// Budget for one whole `create`, shared across the endpoints it walks;
-    /// see [`PoolConfig::create_timeout`]. `None` leaves each attempt
-    /// unbounded.
+    /// see [`PoolConfig::create_timeout`], whose `None` leaves only an
+    /// endpoint's last address unbounded.
     pub create_timeout: Option<Duration>,
 }
 
 impl TcpConnectionManager {
-    /// Resolve `endpoint`, connect, handshake and spawn the actor. Resolution
-    /// goes through tokio's async resolver, not the blocking std
-    /// `ToSocketAddrs`, and takes the first address only.
-    async fn connect_endpoint(&self, endpoint: &str) -> Result<ConnectionHandle> {
-        let addr = tokio::net::lookup_host(endpoint)
+    /// Resolve `endpoint`, connect, handshake and spawn the actor within
+    /// `budget`. Resolution goes through tokio's async resolver, not the
+    /// blocking std `ToSocketAddrs`.
+    async fn connect_endpoint(
+        &self,
+        endpoint: &str,
+        budget: Option<Duration>,
+    ) -> Result<ConnectionHandle> {
+        let began = tokio::time::Instant::now();
+        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(endpoint)
             .await
             .map_err(|e| Error::Connect(format!("tcp: cannot resolve {endpoint:?}: {e}")))?
-            .next()
-            .ok_or_else(|| Error::Connect(format!("tcp: {endpoint:?} resolved to no addresses")))?;
-        let (stream, hello) = connect::open_handshaken(addr, &self.kind, &self.config).await?;
-        Ok(ConnectionActor::spawn_with_config(
-            stream,
-            hello,
-            ActorConfig {
-                read_timeout: self.read_timeout,
-                quota_key: self.config.quota_key.clone(),
-            },
-        ))
+            .collect();
+        let kind = self.kind.for_endpoint(endpoint);
+        let budget = budget.map(|b| b.saturating_sub(began.elapsed()));
+        self.connect_first(endpoint, addrs, &kind, budget).await
+    }
+
+    /// Connect to the first of `addrs` that completes a handshake, so a name
+    /// whose first record is unreachable (`localhost` as `::1` against an
+    /// IPv4-only server) or silent still connects.
+    async fn connect_first(
+        &self,
+        endpoint: &str,
+        addrs: impl IntoIterator<Item = std::net::SocketAddr>,
+        kind: &ConnectKind,
+        budget: Option<Duration>,
+    ) -> Result<ConnectionHandle> {
+        let addrs: Vec<std::net::SocketAddr> = addrs.into_iter().collect();
+        let began = tokio::time::Instant::now();
+        let mut last_err = None;
+        for (i, &addr) in addrs.iter().enumerate() {
+            let remaining = budget.map(|b| b.saturating_sub(began.elapsed()));
+            if remaining.is_some_and(|r| r.is_zero()) {
+                break;
+            }
+            let attempt = connect::open_handshaken(addr, kind, &self.config);
+            let outcome = match attempt_limit(remaining, addrs.len() - i) {
+                Some(limit) => tokio::time::timeout(limit, attempt)
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(Error::Connect(format!(
+                            "tcp: {endpoint:?} at {addr} did not answer within {limit:?}"
+                        )))
+                    }),
+                None => attempt.await,
+            };
+            match outcome {
+                Ok((stream, hello)) => {
+                    return Ok(ConnectionActor::spawn_with_config(
+                        stream,
+                        hello,
+                        ActorConfig {
+                            read_timeout: self.read_timeout,
+                            quota_key: self.config.quota_key.clone(),
+                        },
+                    ));
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            Error::Connect(format!("tcp: {endpoint:?} resolved to no addresses"))
+        }))
     }
 }
 
@@ -136,11 +182,23 @@ impl TcpConnectionManager {
 /// would fail a healthy but distant endpoint just because the list is long.
 const MIN_ENDPOINT_SLICE: Duration = Duration::from_secs(1);
 
-/// The share of `remaining` one attempt may spend with `endpoints_left`
+/// The share of `remaining` one attempt may spend with `attempts_left`
 /// still to try, floored at [`MIN_ENDPOINT_SLICE`] and capped at `remaining`.
-fn endpoint_slice(remaining: Duration, endpoints_left: usize) -> Duration {
-    let share = remaining / u32::try_from(endpoints_left.max(1)).unwrap_or(u32::MAX);
+fn endpoint_slice(remaining: Duration, attempts_left: usize) -> Duration {
+    let share = remaining / u32::try_from(attempts_left.max(1)).unwrap_or(u32::MAX);
     share.max(MIN_ENDPOINT_SLICE).min(remaining)
+}
+
+/// How long one address may take, with `left` addresses still to try. With no
+/// budget, every address but the last gets [`DEFAULT_CREATE_TIMEOUT`], so a
+/// silent one cannot hold back the next and the last keeps the caller's
+/// unbounded wait.
+fn attempt_limit(remaining: Option<Duration>, left: usize) -> Option<Duration> {
+    match remaining {
+        Some(remaining) => Some(endpoint_slice(remaining, left)),
+        None if left > 1 => Some(DEFAULT_CREATE_TIMEOUT),
+        None => None,
+    }
 }
 
 impl managed::Manager for TcpConnectionManager {
@@ -165,7 +223,6 @@ impl managed::Manager for TcpConnectionManager {
         let mut last_err: Option<Error> = None;
         for i in 0..n {
             let endpoint = &self.endpoints[(start + i) % n];
-            let attempt = self.connect_endpoint(endpoint);
             let outcome = match self.create_timeout {
                 Some(total) => {
                     let remaining = total.saturating_sub(began.elapsed());
@@ -173,7 +230,8 @@ impl managed::Manager for TcpConnectionManager {
                         break;
                     }
                     let slice = endpoint_slice(remaining, n - i);
-                    tokio::time::timeout(slice, attempt)
+                    // The outer bound also covers name resolution.
+                    tokio::time::timeout(slice, self.connect_endpoint(endpoint, Some(slice)))
                         .await
                         .unwrap_or_else(|_| {
                             Err(Error::Connect(format!(
@@ -181,7 +239,7 @@ impl managed::Manager for TcpConnectionManager {
                             )))
                         })
                 }
-                None => attempt.await,
+                None => self.connect_endpoint(endpoint, None).await,
             };
             match outcome {
                 Ok(handle) => return Ok(handle),
@@ -268,8 +326,10 @@ pub struct PoolConfig {
     /// How long `Manager::create` may take in total. The budget is split
     /// across the endpoints it walks, each attempt getting the remaining
     /// time divided by the endpoints left (never under one second), so a
-    /// silent first endpoint still leaves time for the next. `None` waits
-    /// indefinitely.
+    /// silent first endpoint still leaves time for the next. An endpoint's
+    /// share is split the same way across the addresses its name resolves to.
+    /// `None` bounds every address but an endpoint's last at the 10s default
+    /// and waits on the last indefinitely.
     pub create_timeout: Option<Duration>,
     /// How long `Manager::recycle` may take before deadpool aborts
     /// it. `None` waits indefinitely.
@@ -357,9 +417,10 @@ pub enum ConnectKindConfig {
     /// if the feature is missing rather than silently downgrading to
     /// plain.
     Tls {
-        /// SNI sent in the ClientHello and the name the certificate is
-        /// validated against.
-        server_name: String,
+        /// SNI sent in the ClientHello and the name every endpoint's
+        /// certificate is validated against. `None` validates each endpoint
+        /// against its own host, so failover to another host verifies.
+        server_name: Option<String>,
     },
 }
 
@@ -911,6 +972,76 @@ mod tests {
         );
     }
 
+    /// One name resolving to several addresses is tried address by address,
+    /// and an empty resolution names the endpoint.
+    #[tokio::test]
+    async fn an_endpoint_walks_every_address_it_resolves_to() {
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refusing = dead.local_addr().unwrap();
+        drop(dead);
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let accepting: std::net::SocketAddr = spawn_mock_endpoint(1, 1, Arc::clone(&order))
+            .await
+            .parse()
+            .unwrap();
+        let mgr = manager_over(vec!["dual.example:9000".to_string()]);
+
+        mgr.connect_first(
+            "dual.example:9000",
+            [refusing, accepting],
+            &ConnectKind::Plain,
+            None,
+        )
+        .await
+        .expect("the second address must be reached");
+        assert_eq!(order.lock().unwrap().clone(), vec![1]);
+
+        let Err(err) = mgr
+            .connect_first("dual.example:9000", [], &ConnectKind::Plain, None)
+            .await
+        else {
+            panic!("no address cannot connect")
+        };
+        assert!(err.to_string().contains("dual.example:9000"), "{err}");
+    }
+
+    /// An address that accepts and never answers must not hold back the
+    /// healthy address after it under the same name.
+    #[tokio::test]
+    async fn a_silent_first_address_leaves_budget_for_the_second() {
+        let hole = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let silent = hole.local_addr().unwrap();
+        let holder = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = hole.accept().await {
+                held.push(sock);
+            }
+        });
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let live: std::net::SocketAddr = spawn_mock_endpoint(1, 1, Arc::clone(&order))
+            .await
+            .parse()
+            .unwrap();
+        let mgr = manager_over(vec!["dual.example:9000".to_string()]);
+
+        // The outer timeout only stops a regression hanging the suite.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(8),
+            mgr.connect_first(
+                "dual.example:9000",
+                [silent, live],
+                &ConnectKind::Plain,
+                Some(Duration::from_secs(4)),
+            ),
+        )
+        .await;
+        holder.abort();
+        outcome
+            .expect("the endpoint answered inside its budget")
+            .expect("the live address must be reached");
+        assert_eq!(order.lock().unwrap().clone(), vec![1]);
+    }
+
     /// A host that accepts and never answers holds a connect for the whole
     /// create budget unless each endpoint gets its own slice of it.
     #[tokio::test]
@@ -940,6 +1071,26 @@ mod tests {
         );
         assert_eq!(order.lock().unwrap().clone(), vec![1]);
         holder.abort();
+    }
+
+    /// `(remaining budget, addresses left, limit)`: a budget splits like the
+    /// endpoint one, and no budget bounds all but the last address.
+    #[test]
+    fn attempt_limit_bounds_every_address_but_an_unbudgeted_last() {
+        let s = Duration::from_secs;
+        for (remaining, left, expected) in [
+            (Some(s(4)), 2, Some(s(2))),
+            (Some(s(4)), 1, Some(s(4))),
+            (None, 3, Some(DEFAULT_CREATE_TIMEOUT)),
+            (None, 2, Some(DEFAULT_CREATE_TIMEOUT)),
+            (None, 1, None),
+        ] {
+            assert_eq!(
+                attempt_limit(remaining, left),
+                expected,
+                "{remaining:?} over {left}"
+            );
+        }
     }
 
     #[test]
@@ -1052,7 +1203,7 @@ mod tests {
         let pool = build_pool(
             vec!["127.0.0.1:9440".to_string()],
             ConnectKindConfig::Tls {
-                server_name: "example.invalid".to_string(),
+                server_name: Some("example.invalid".to_string()),
             },
             HandshakeConfig::default(),
             PoolConfig::default(),

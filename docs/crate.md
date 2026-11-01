@@ -7,12 +7,12 @@ It depends on the published `clickhouse` release and changes nothing in it, so t
 ## What it gives you
 
 - The native protocol on port 9000, with TLS, a connection pool, endpoint failover and opt-in jittered retry for idempotent calls.
-- Runtime-schema inserts: hand it `serde_json::Map` rows, with no Rust struct written per table. `Tuple`, `Variant`, `Dynamic` and `Point` columns are refused by name.
+- Runtime-schema inserts: hand it `serde_json::Map` rows, with no Rust struct written per table. `Tuple`, `Variant` and `Dynamic` columns are refused by name.
 - A per-table schema read from `system.columns` and cached, so rows encode straight to RowBinary or Native, never to JSONEachRow text for the server to parse.
 - Explicit per-table batches: each insert targets one table and commits on `end()`, sent over TCP as Native blocks flushed at 1 MiB.
 - Insert errors classified as transport, schema drift or bad rows. A transport failure can leave it unknown whether the rows landed, so retry only where a duplicate is harmless or deduplicated.
 - An opt-in unified client (`unified` feature): one `UnifiedClient` that runs the same queries and inserts over HTTP or native TCP, the transport chosen by configuration at runtime.
-- `JSON`, `Variant` and `Dynamic` columns read back as their document text over native TCP. A value ClickHouse spilled to `SharedVariant` is not decoded: a JSON path stored there is left out, and a `Dynamic` one reads as `null`.
+- `JSON`, `Variant` and `Dynamic` columns read back as their document text, over native TCP and over HTTP through `UnifiedClient`. A `JSON` value ClickHouse spilled to shared data or `SharedVariant` reads whole by default, and with `with_json_as_string(false)` the query fails naming the column rather than leaving the value out. A `Dynamic` or `Variant` value the decoder cannot print the way the server does (a `SharedVariant` spill, a date or time) fails the query the same way, and the error says to cast the column to String in the query.
 - `ServerException::parse` to read the ClickHouse error code and name out of an HTTP error.
 
 ## Example
@@ -51,6 +51,13 @@ async fn main() -> dfe_clickhouse::Result<()> {
 ```
 
 Add `clickhouse` too, swap in `UnifiedClient::Http(clickhouse::Client::default().with_url("http://localhost:8123"))`, and the same rows go over HTTP.
+
+Why native, from a 100k-row runtime-schema insert against ClickHouse 26.3 on 2026-11-01 ([method and full table](https://github.com/hyperi-io/dfe-clickhouse-rs/blob/main/docs/insert-formats.md#native-against-http-rowbinary)):
+
+- About half the elapsed time: 799 and 920 ms against 1,548-2,281 ms over HTTP RowBinary.
+- 16-36% less server CPU: 772 and 889 ms against 997-1,206 ms.
+- 7-32% more client CPU, because the client builds the columns: 659 and 692 ms against 523-617 ms.
+- No compression yet: the protocol supports LZ4 blocks, but this client sends them uncompressed, 32 MB on the wire where HTTP with LZ4 sends 6.4 MB.
 
 ## Features
 

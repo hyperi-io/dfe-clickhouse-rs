@@ -644,9 +644,12 @@ mod tests {
             DynamicError::SchemaMismatch { .. }
         ));
 
-        // A bare code is upstream's stand-in for a body it could not read.
+        // `Code: N` is upstream's stand-in for a body it could not read.
         assert!(matches!(
-            classify_error("db.t", clickhouse::error::Error::BadResponse("117".into())),
+            classify_error(
+                "db.t",
+                clickhouse::error::Error::BadResponse("Code: 117".into())
+            ),
             DynamicError::SchemaMismatch { .. }
         ));
     }
