@@ -43,6 +43,7 @@ pub(crate) mod decode;
 pub(crate) mod encode;
 pub(crate) mod io;
 pub(crate) mod sparse;
+pub(crate) mod type_name;
 
 pub use columns::ColumnType;
 pub use decode::{DecodedBlock, DecodedColumn, FromColumn};

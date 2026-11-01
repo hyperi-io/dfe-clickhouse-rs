@@ -148,10 +148,11 @@ pub enum ColumnType {
     Dynamic,
 }
 
-/// Upper bound on type-name nesting [`ColumnType::parse`] accepts. The parser
-/// recurses once per wrapper, and `type_name` is server-controlled and capped
+/// Upper bound on type-name nesting [`ColumnType::parse`] and the
+/// well-formedness check before it accept. Both recurse once per wrapper,
+/// and `type_name` is server-controlled and capped
 /// only at `MAX_STRING_SIZE`, so a deep name would otherwise blow the stack.
-const MAX_TYPE_PARSE_DEPTH: usize = 32;
+pub(crate) const MAX_TYPE_PARSE_DEPTH: usize = 32;
 
 impl ColumnType {
     /// Parse a `ClickHouse` type name into `ColumnType`.
@@ -1587,48 +1588,24 @@ const CAST_REMEDY: &str =
 /// `kind` and `remedy` wording the refusal for one this decoder cannot
 /// represent. `SharedVariant` spill values ride as a String sub-column.
 ///
-/// A name shaped like a server type is a legitimate value this decoder does
-/// not support, so it is [`Error::Unsupported`]. Anything else is a malformed
-/// response, [`Error::BadResponse`].
+/// A malformed name is a corrupt response, [`Error::BadResponse`], checked
+/// before parsing so a lenient parse cannot accept it. A well-formed one this
+/// decoder cannot represent is a legitimate value it does not support,
+/// [`Error::Unsupported`].
 fn wire_type(name: &str, kind: &str, remedy: &str) -> Result<ColumnType> {
     if name == SHARED_VARIANT {
         return Ok(ColumnType::String);
     }
+    if !crate::native::type_name::is_well_formed(name) {
+        return Err(Error::BadResponse(format!(
+            "native protocol: '{name}' is not a column type"
+        )));
+    }
     ColumnType::parse(name).ok_or_else(|| {
-        if looks_like_a_type_name(name) {
-            Error::Unsupported(format!(
-                "{kind} of type {name} have no decoder here. {remedy}"
-            ))
-        } else {
-            Error::BadResponse(format!("native protocol: '{name}' is not a column type"))
-        }
+        Error::Unsupported(format!(
+            "{kind} of type {name} have no decoder here. {remedy}"
+        ))
     })
-}
-
-/// Whether `name` is spelled like a server type: a letter first, no control
-/// characters, and brackets that balance outside quotes.
-fn looks_like_a_type_name(name: &str) -> bool {
-    if !name.starts_with(|c: char| c.is_ascii_alphabetic()) || name.chars().any(char::is_control) {
-        return false;
-    }
-    let mut depth = 0usize;
-    let mut quote = None;
-    let mut escaped = false;
-    for c in name.chars() {
-        match (quote, c) {
-            (Some(_), _) if escaped => escaped = false,
-            (Some(_), '\\') => escaped = true,
-            (Some(q), c) if c == q => quote = None,
-            (None, '\'' | '`') => quote = Some(c),
-            (None, '(') => depth += 1,
-            (None, ')') => match depth.checked_sub(1) {
-                Some(d) => depth = d,
-                None => return false,
-            },
-            _ => {}
-        }
-    }
-    depth == 0 && quote.is_none()
 }
 
 /// JSON FLATTENED object column reader, after the u64 version has been
@@ -2577,15 +2554,63 @@ mod tests {
         );
     }
 
+    /// A server can announce a name nested far past the parser's limit. It
+    /// must come back as a malformed response, checked on a 256 KiB stack so
+    /// unbounded recursion fails the test rather than fitting a larger one.
+    /// A name at exactly the limit still reads.
+    #[test]
+    fn a_name_nested_past_the_limit_is_refused_without_recursing() {
+        let nested = |depth: usize| format!("{}UInt8{}", "Array(".repeat(depth), ")".repeat(depth));
+        let deep = nested(100_000);
+        let at_limit = nested(MAX_TYPE_PARSE_DEPTH);
+        let past_limit = nested(MAX_TYPE_PARSE_DEPTH + 1);
+        let outcome = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                [deep, at_limit, past_limit]
+                    .map(|name| wire_type(&name, "Dynamic values", CAST_REMEDY))
+            })
+            .unwrap()
+            .join()
+            .expect("the check returns rather than overflowing the stack");
+        let [deep, at_limit, past_limit] = outcome;
+        assert!(matches!(deep, Err(Error::BadResponse(_))), "{deep:?}");
+        assert!(matches!(at_limit, Ok(ColumnType::Array(_))), "{at_limit:?}");
+        assert!(
+            matches!(past_limit, Err(Error::BadResponse(_))),
+            "{past_limit:?}"
+        );
+    }
+
     /// `(announced type, unsupported)`: a name spelled like a server type that
     /// the parser cannot represent is an unsupported value, anything else a
     /// malformed response.
     #[test]
     fn an_unparsed_type_name_is_unsupported_only_when_well_formed() {
+        let mut wrong = Vec::new();
         for (name, unsupported) in [
             ("Tuple(x UInt8)", true),
             ("IntervalSecond", true),
             ("Tuple(s Enum8('a)' = 1))", true),
+            ("Variant(IntervalSecond, String)", true),
+            ("Nested(a UInt8, b Ring)", true),
+            ("AggregateFunction(quantiles(0.5, 0.9), UInt64)", true),
+            ("Map(String, IntervalDay)", true),
+            // Balanced, and still not a type.
+            ("UInt8;garbage", false),
+            ("Array(,)", false),
+            ("Map(UInt8)", false),
+            ("Map(String, UInt8, UInt8)", false),
+            ("Array()", false),
+            ("Array(UInt8, UInt8)", false),
+            ("Array(Nullable)", false),
+            ("UInt8()", false),
+            ("Tuple(UInt8,)", false),
+            ("Tuple(x UInt8 y)", false),
+            ("Array(UInt8) UInt8", false),
+            ("Enum8('a' = )", false),
+            ("Decimal(1, 2, 3)", false),
+            ("Foo(=)", false),
             ("Tuple(x UInt8", false),
             ("Tuple(x))", false),
             ("Foo('a)", false),
@@ -2594,13 +2619,12 @@ mod tests {
             ("Int\u{1}", false),
         ] {
             match wire_type(name, "Dynamic values", CAST_REMEDY) {
-                Err(Error::Unsupported(m)) if unsupported => {
-                    assert!(m.contains(name) && m.contains("AS String)"), "{m}");
-                }
+                Err(Error::Unsupported(m)) if unsupported && m.contains(name) => {}
                 Err(Error::BadResponse(_)) if !unsupported => {}
-                other => panic!("{name:?}: {other:?}"),
+                other => wrong.push(format!("{name:?}: {other:?}")),
             }
         }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
     /// A JSON path whose announced type the parser cannot represent is
