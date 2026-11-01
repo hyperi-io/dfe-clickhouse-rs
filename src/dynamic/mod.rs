@@ -20,6 +20,7 @@
 //! The five modules below were ported from the DFE Loader and relicensed
 //! Apache-2.0 to match the crate.
 
+mod datetime;
 pub mod encode;
 pub mod error;
 pub mod insert;

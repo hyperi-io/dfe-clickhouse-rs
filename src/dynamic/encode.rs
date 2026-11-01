@@ -20,8 +20,9 @@
 //!
 //! Coercions ClickHouse's JSONEachRow path cannot do server-side: epoch
 //! magnitude detection (ms/us/ns) and ISO-8601 'T'-separator handling for
-//! date/time types, hyphen-less UUID hex, and integer-to-dotted IPv4. All
-//! timestamps are UTC; a non-zero timezone offset is rejected, never dropped.
+//! date/time types, hyphen-less UUID hex, and integer-to-dotted IPv4. Date-time
+//! text with no zone is UTC, and an offset (`Z`, `+HH`, `+HHMM`, `+HH:MM`) is
+//! applied, so the stored instant is the one the source named.
 //!
 //! A coercion that would lose information is an error, not a silent write: an
 //! out-of-range integer, a decimal past its backing width, an impossible
@@ -34,6 +35,7 @@ use serde_json::{Map, Value};
 
 use crate::native::io::ClickHouseBytesWrite;
 
+use super::datetime::{self, civil_days_from_epoch, days_in_month};
 use super::error::DynamicError;
 use super::parsed_type::{ParsedType, TypeTag};
 
@@ -793,21 +795,10 @@ fn epoch_to_seconds(ts: i64) -> i64 {
     }
 }
 
-/// Days in `month` of `year`, proleptic Gregorian.
-fn days_in_month(year: i32, month: u32) -> u32 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
-        2 => 28,
-        _ => 0,
-    }
-}
-
 /// Reject a date that does not exist -- `2026-02-31` would otherwise roll
 /// forward to `2026-03-03` and store a day nobody wrote.
 fn check_calendar_day(year: i32, month: u32, day: u32) -> bool {
-    (1..=12).contains(&month) && day >= 1 && day <= days_in_month(year, month)
+    u32::try_from(year).is_ok_and(|year| day >= 1 && day <= days_in_month(year, month))
 }
 
 /// Resolve a JSON value to whole epoch seconds (UTC). Accepts a date/datetime
@@ -826,8 +817,7 @@ fn to_epoch_seconds(value: &Value, col: &str) -> Result<i64, DynamicError> {
             if let Ok(raw) = s.parse::<i64>() {
                 return Ok(epoch_to_seconds(raw));
             }
-            let (secs, _) = parse_datetime_str(s).map_err(|m| enc_err(col, &m))?;
-            Ok(secs)
+            Ok(datetime::parse(s).map_err(|m| enc_err(col, m))?.secs)
         }
         _ => Err(enc_err(col, "expected datetime string or epoch number")),
     }
@@ -875,120 +865,13 @@ fn datetime64_to_ticks(value: &Value, precision: u8, col: &str) -> Result<i64, D
             if let Ok(n) = s.parse::<i64>() {
                 return Ok(n);
             }
-            let (secs, frac_nanos) = parse_datetime_str(s).map_err(|m| enc_err(col, &m))?;
-            let multiplier = 10i64.pow(u32::from(precision));
-            let base = secs
-                .checked_mul(multiplier)
-                .ok_or_else(|| enc_err(col, "DateTime64 epoch overflow"))?;
-            let frac_scaled =
-                i64::from(frac_nanos) / 10i64.pow(9u32.saturating_sub(u32::from(precision)));
-            base.checked_add(frac_scaled)
+            datetime::parse(s)
+                .map_err(|m| enc_err(col, m))?
+                .ticks(precision)
                 .ok_or_else(|| enc_err(col, "DateTime64 epoch overflow"))
         }
         _ => Err(enc_err(col, "expected number or datetime string")),
     }
-}
-
-/// Parse `YYYY-MM-DD[ T]HH:MM:SS[.frac][Z|+00:00]` into `(unix_seconds,
-/// fractional_nanoseconds)`. UTC only; non-zero offsets are rejected.
-fn parse_datetime_str(s: &str) -> Result<(i64, u32), String> {
-    let bytes = s.as_bytes();
-    let len = bytes.len();
-
-    if len < 19 {
-        return Err("invalid DateTime string".into());
-    }
-    // Every index below is a byte offset into `s`; without this a multibyte
-    // char inside a 19-byte string would split a char and panic.
-    if !s.is_ascii() {
-        return Err("invalid DateTime string".into());
-    }
-    let sep = bytes[10];
-    if sep != b' ' && sep != b'T' {
-        return Err("invalid DateTime string".into());
-    }
-
-    let mut pos = 19;
-
-    let frac_nanos = if pos < len && bytes[pos] == b'.' {
-        pos += 1;
-        let frac_start = pos;
-        while pos < len && bytes[pos].is_ascii_digit() {
-            pos += 1;
-        }
-        let frac_digits = pos - frac_start;
-        if frac_digits == 0 {
-            return Err("invalid DateTime string".into());
-        }
-        let clamped = frac_digits.min(9);
-        let frac_slice = &s[frac_start..frac_start + clamped];
-        let mut frac: u32 = frac_slice
-            .parse()
-            .map_err(|_| "invalid fractional seconds".to_string())?;
-        if clamped < 9 {
-            // `clamped` is at most 9 by the line above, so the exponent fits.
-            frac *= 10u32.pow(9 - u32::try_from(clamped).unwrap_or(9));
-        }
-        frac
-    } else {
-        0u32
-    };
-
-    if pos < len {
-        if bytes[pos] == b'Z' {
-            pos += 1;
-        } else if (bytes[pos] == b'+' || bytes[pos] == b'-') && pos + 6 <= len {
-            let sign = bytes[pos];
-            let tz_slice = &s[pos + 1..pos + 6];
-            if tz_slice.len() == 5
-                && tz_slice.as_bytes()[2] == b':'
-                && tz_slice[..2].bytes().all(|b| b.is_ascii_digit())
-                && tz_slice[3..].bytes().all(|b| b.is_ascii_digit())
-            {
-                if sign == b'-' || &tz_slice[..2] != "00" || &tz_slice[3..] != "00" {
-                    return Err(format!(
-                        "non-UTC timezone offset '{}{}' not supported; convert to UTC first",
-                        sign as char, tz_slice
-                    ));
-                }
-                pos += 6;
-            }
-        }
-    }
-
-    if pos != len {
-        return Err("invalid DateTime string".into());
-    }
-
-    let year: i32 = s[0..4].parse().map_err(|_| "invalid year".to_string())?;
-    let month: u32 = s[5..7].parse().map_err(|_| "invalid month".to_string())?;
-    let day: u32 = s[8..10].parse().map_err(|_| "invalid day".to_string())?;
-    let hour: u32 = s[11..13].parse().map_err(|_| "invalid hour".to_string())?;
-    let min: u32 = s[14..16]
-        .parse()
-        .map_err(|_| "invalid minute".to_string())?;
-    let second: u32 = s[17..19]
-        .parse()
-        .map_err(|_| "invalid second".to_string())?;
-
-    if !check_calendar_day(year, month, day) || hour > 23 || min > 59 || second > 59 {
-        return Err("invalid DateTime string".into());
-    }
-
-    let days = civil_days_from_epoch(year, month, day);
-    let secs = days * 86_400 + i64::from(hour) * 3600 + i64::from(min) * 60 + i64::from(second);
-    Ok((secs, frac_nanos))
-}
-
-/// Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm).
-fn civil_days_from_epoch(year: i32, month: u32, day: u32) -> i64 {
-    let y = i64::from(if month <= 2 { year - 1 } else { year });
-    let m = i64::from(if month <= 2 { month + 9 } else { month - 3 });
-    let era = y.div_euclid(400);
-    let yoe = y.rem_euclid(400);
-    let day_of_year = (153 * m + 2) / 5 + i64::from(day) - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + day_of_year;
-    era * 146_097 + doe - 719_468
 }
 
 // ---------------------------------------------------------------------------
@@ -1445,13 +1328,23 @@ mod tests {
         );
     }
 
+    /// An offset moves the text to the instant it names, it is never dropped.
     #[test]
-    fn datetime64_rejects_nonzero_offset() {
-        let e = enc_err_of(
-            json!({"ts": "2026-04-07 07:03:00+05:30"}),
-            &[("ts", "DateTime64(3)")],
+    fn datetime64_applies_an_offset() {
+        assert_eq!(
+            enc(
+                json!({"ts": "2026-04-07 12:33:00.5+05:30"}),
+                &[("ts", "DateTime64(3)")]
+            ),
+            1_775_545_380_500i64.to_le_bytes()
         );
-        assert!(format!("{e}").contains("non-UTC"), "got: {e}");
+        assert_eq!(
+            enc(
+                json!({"ts": "2026-04-07T17:03:00+10"}),
+                &[("ts", "DateTime")]
+            ),
+            1_775_545_380u32.to_le_bytes()
+        );
     }
 
     // ---- Decimal ----
