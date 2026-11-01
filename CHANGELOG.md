@@ -3,6 +3,12 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [0.1.7](https://github.com/hyperi-io/dfe-clickhouse-rs/compare/v0.1.6...v0.1.7) (2026-11-01)
+
+### Bug Fixes
+
+* report the error from the address that answered ([#37](https://github.com/hyperi-io/dfe-clickhouse-rs/issues/37)) ([18558be](https://github.com/hyperi-io/dfe-clickhouse-rs/commit/18558be0787cdbe886e11c5bdf36b55c7e681ff6))
+
 ## [0.1.6](https://github.com/hyperi-io/dfe-clickhouse-rs/compare/v0.1.5...v0.1.6) (2026-11-01)
 
 ### Bug Fixes
