@@ -3,6 +3,12 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [0.1.9](https://github.com/hyperi-io/dfe-clickhouse-rs/compare/v0.1.8...v0.1.9) (2026-11-01)
+
+### Bug Fixes
+
+* bring the loader's dynamic-insert fixes into the crate ([#40](https://github.com/hyperi-io/dfe-clickhouse-rs/issues/40)) ([3bdd6c2](https://github.com/hyperi-io/dfe-clickhouse-rs/commit/3bdd6c22d0d7ae8aec5a7a82e145ffba983d54ea))
+
 ## [0.1.8](https://github.com/hyperi-io/dfe-clickhouse-rs/compare/v0.1.7...v0.1.8) (2026-11-01)
 
 ### Bug Fixes
