@@ -16,6 +16,8 @@ use std::borrow::Cow;
 
 use serde_json::{Map, Value};
 
+use super::parsed_type::{ParsedType, TypeTag};
+
 /// The key a root-level array is stored under in a JSON column.
 ///
 /// `list` is the key DFE's stored data and queries already read (ECS `tags`
@@ -147,6 +149,33 @@ fn wrap_json_text(key: &str, json: &str) -> Vec<u8> {
     out.extend_from_slice(json.as_bytes());
     out.push(b'}');
     out
+}
+
+/// Whether `value`, bound for an `Array(elem)`, is one element rather than the
+/// array. Elasticsearch lets any field carry one value or many, so a scalar is
+/// one element, an object is one where the element reads from an object, and
+/// a bare `[lon, lat]` is one point of an array of points.
+pub(crate) fn is_single_element(value: &Value, elem: &ParsedType) -> bool {
+    match value {
+        Value::Bool(_) | Value::Number(_) | Value::String(_) => true,
+        Value::Object(_) => reads_objects(elem),
+        Value::Array(items) => elem.tag == TypeTag::Point && is_coordinate_pair(items),
+        Value::Null => false,
+    }
+}
+
+/// Whether a value of this type can be read from a JSON object.
+fn reads_objects(ty: &ParsedType) -> bool {
+    match ty.tag {
+        TypeTag::JSON | TypeTag::Map | TypeTag::Point => true,
+        TypeTag::Array => ty.array_element.as_deref().is_some_and(reads_objects),
+        _ => false,
+    }
+}
+
+/// `[lon, lat]` or `[lon, lat, z]`, all numbers.
+fn is_coordinate_pair(items: &[Value]) -> bool {
+    matches!(items.len(), 2 | 3) && items.iter().all(Value::is_number)
 }
 
 /// Read a geo point as `(longitude, latitude)` from any form Elasticsearch
@@ -328,6 +357,30 @@ mod tests {
             let mut shaped_now = value.clone();
             shape_json_value(&mut shaped_now);
             assert_eq!(shaped_now, shaped, "{value}");
+        }
+    }
+
+    /// `(value, element type, one element)`.
+    #[test]
+    fn a_single_value_is_one_element_of_an_array() {
+        for (value, element, single) in [
+            (json!("one"), "String", true),
+            (json!(5), "UInt32", true),
+            (json!(true), "Bool", true),
+            (json!(["a"]), "String", false),
+            (json!({"k": "v"}), "Map(String, String)", true),
+            (json!({"k": "v"}), "String", false),
+            (json!({"lat": 1, "lon": 2}), "Point", true),
+            (json!([1.5, 2.5]), "Point", true),
+            (json!([[1.5, 2.5]]), "Point", false),
+            (json!([1, 2]), "UInt8", false),
+            (Value::Null, "String", false),
+        ] {
+            assert_eq!(
+                is_single_element(&value, &ParsedType::parse(element)),
+                single,
+                "{value} into Array({element})"
+            );
         }
     }
 

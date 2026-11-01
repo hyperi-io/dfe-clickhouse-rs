@@ -38,7 +38,7 @@ use crate::native::io::ClickHouseBytesWrite;
 use super::datetime::{self, civil_days_from_epoch, days_in_month};
 use super::error::DynamicError;
 use super::parsed_type::{ParsedType, TypeTag};
-use super::shape::{geo_point_lon_lat, json_column_text};
+use super::shape::{geo_point_lon_lat, is_single_element, json_column_text};
 
 /// A single resolved column for a dynamic insert.
 #[derive(Debug, Clone)]
@@ -948,12 +948,18 @@ fn encode_ipv6(value: &Value, col: &str, buf: &mut Vec<u8>) -> Result<(), Dynami
 // Array / Map
 // ---------------------------------------------------------------------------
 
+/// Write an `Array(elem)`. A single value the element takes is written as a
+/// one-element array.
 fn encode_array(
     value: &Value,
     elem: &ParsedType,
     col: &str,
     buf: &mut Vec<u8>,
 ) -> Result<(), DynamicError> {
+    if is_single_element(value, elem) {
+        buf.put_var_uint(1);
+        return encode_value(value, elem, col, buf);
+    }
     let Value::Array(arr) = value else {
         return Err(enc_err(col, "expected array"));
     };
