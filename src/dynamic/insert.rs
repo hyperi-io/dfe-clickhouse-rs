@@ -34,6 +34,8 @@
 //! supply a different set go to an INSERT of their own. HTTP keeps up to four
 //! of those open at once, so a batch is one INSERT per set its rows carry. TCP
 //! keeps one, so a row with a new set commits the rows before it.
+//! A client `insert_deduplication_token` is split the same way, one token per
+//! INSERT, so the INSERTs of one batch do not suppress each other.
 //!
 //! On a schema-mismatch error the cached schema is invalidated so the next
 //! insert re-fetches, unless [`SchemaRefresh::AtExpiry`] says to keep it until
@@ -73,6 +75,14 @@ const TYPES_FROM_HEADER_SETTING: &str = "input_format_with_types_use_header";
 /// The server setting that reads header types as binary encodings, where the
 /// header carries them as type names. Set off on every HTTP insert.
 const BINARY_TYPES_SETTING: &str = "input_format_binary_decode_types_in_binary_format";
+
+/// The server setting that makes a `RowBinaryWithDefaults` reader fill a
+/// flagged column with its DEFAULT expression. Off, it writes the type's zero.
+/// Set on an HTTP insert of rows that supply no column at all.
+const DEFAULTS_FOR_OMITTED_SETTING: &str = "input_format_defaults_for_omitted_fields";
+
+/// The setting a caller sets to make a retried batch land once.
+const DEDUP_TOKEN_SETTING: &str = "insert_deduplication_token";
 
 /// HTTP INSERTs held open at once, one per set of defaulted columns the rows
 /// supply. A row with a further set commits the oldest first.
@@ -146,6 +156,13 @@ enum OpenSink {
         insert: InsertFormatted,
         /// RowBinary rows held for the next chunk, behind the
         /// `RowBinaryWithNamesAndTypes` header in the first one.
+        chunk: Vec<u8>,
+    },
+    /// Rows that supply no column, sent as `RowBinaryWithDefaults` with every
+    /// column flagged, so no value bytes cross the wire.
+    HttpDefaults {
+        insert: InsertFormatted,
+        /// One flag byte per column per row, held for the next chunk.
         chunk: Vec<u8>,
     },
     #[cfg(feature = "tcp")]
@@ -233,6 +250,8 @@ pub struct DynamicInsert {
     schema: Option<Arc<DynamicSchema>>,
     /// Open INSERTs, oldest first.
     active: Vec<Active>,
+    /// [`default_shape`] of every INSERT opened so far, in order.
+    opened: Vec<Vec<bool>>,
     rows_written: u64,
     timeouts: InsertTimeouts,
     refresh: SchemaRefresh,
@@ -256,6 +275,7 @@ impl DynamicInsert {
             table: table.to_string(),
             schema: None,
             active: Vec::new(),
+            opened: Vec::new(),
             rows_written: 0,
             timeouts: InsertTimeouts::default(),
             refresh: SchemaRefresh::default(),
@@ -276,6 +296,7 @@ impl DynamicInsert {
             table: table.to_string(),
             schema: Some(schema),
             active: Vec::new(),
+            opened: Vec::new(),
             rows_written: 0,
             timeouts: InsertTimeouts::default(),
             refresh: SchemaRefresh::default(),
@@ -365,15 +386,36 @@ impl DynamicInsert {
                 message: "schema not available after fetch".to_string(),
             })?;
 
-        let columns = select_columns(row, raw_names, schema);
+        let shape: Vec<bool> = default_shape(row, raw_names, schema).collect();
+        let selected = select_columns(row, raw_names, schema);
+        // A row that supplies no column names none, and an INSERT must name one.
+        let defaults_only = selected.is_empty();
+        let columns = if defaults_only {
+            schema
+                .columns
+                .iter()
+                .filter(|c| insertable(c))
+                .cloned()
+                .collect()
+        } else {
+            selected
+        };
         if columns.is_empty() {
             return Err(DynamicError::EncodingError {
                 column: String::new(),
                 message: "no columns to insert for this row".to_string(),
             });
         }
-        let shape: Vec<bool> = default_shape(row, raw_names, schema).collect();
         let json_columns = schema.has_json_columns();
+        let set: Vec<String> = schema
+            .columns
+            .iter()
+            .filter(|c| c.has_default && insertable(c))
+            .zip(&shape)
+            .filter(|(_, supplied)| **supplied)
+            .map(|(c, _)| escape_ident(&c.name))
+            .collect();
+        let earlier = self.opened.iter().filter(|s| **s == shape).count();
 
         let target = format!(
             "{}.{}",
@@ -388,25 +430,50 @@ impl DynamicInsert {
 
         let sink = match &self.backend {
             Backend::Http { client, .. } => {
-                let sql =
-                    format!("INSERT INTO {target} ({cols_sql}) FORMAT RowBinaryWithNamesAndTypes");
-                let mut client = client
-                    .clone()
-                    .with_setting(TYPES_FROM_HEADER_SETTING, "1")
-                    .with_setting(BINARY_TYPES_SETTING, "0");
+                let format = if defaults_only {
+                    "RowBinaryWithDefaults"
+                } else {
+                    "RowBinaryWithNamesAndTypes"
+                };
+                let sql = format!("INSERT INTO {target} ({cols_sql}) FORMAT {format}");
+                let mut client = client.clone();
+                if let Some(token) = client.get_setting(DEDUP_TOKEN_SETTING) {
+                    let token = split_token(token, &set, earlier);
+                    client = client.with_setting(DEDUP_TOKEN_SETTING, token);
+                }
                 if json_columns {
                     client = client.with_setting(JSON_AS_STRING_SETTING, "1");
                 }
-                OpenSink::Http {
-                    insert: client
+                if defaults_only {
+                    let insert = client
+                        .with_setting(DEFAULTS_FOR_OMITTED_SETTING, "1")
                         .insert_formatted_with(sql)
-                        .with_timeouts(self.timeouts.send, self.timeouts.end),
-                    chunk: names_and_types_header(&columns),
+                        .with_timeouts(self.timeouts.send, self.timeouts.end);
+                    OpenSink::HttpDefaults {
+                        insert,
+                        chunk: Vec::new(),
+                    }
+                } else {
+                    let insert = client
+                        .with_setting(TYPES_FROM_HEADER_SETTING, "1")
+                        .with_setting(BINARY_TYPES_SETTING, "0")
+                        .insert_formatted_with(sql)
+                        .with_timeouts(self.timeouts.send, self.timeouts.end);
+                    OpenSink::Http {
+                        insert,
+                        chunk: names_and_types_header(&columns),
+                    }
                 }
             }
             #[cfg(feature = "tcp")]
             Backend::Tcp { client, .. } => {
                 let full = self.full_table();
+                if defaults_only {
+                    return Err(DynamicError::EncodingError {
+                        column: String::new(),
+                        message: "no columns to insert for this row".to_string(),
+                    });
+                }
                 let sql = format!("INSERT INTO {target} ({cols_sql}) FORMAT Native");
                 let headers: Vec<(String, String)> = columns
                     .iter()
@@ -414,10 +481,16 @@ impl DynamicInsert {
                     .collect();
                 let native =
                     ColumnSchema::from_headers(&headers).map_err(|e| classify_error(&full, e))?;
+                let token = client
+                    .setting(DEDUP_TOKEN_SETTING)
+                    .map(|token| split_token(token, &set, earlier));
                 // Empty query id: the server allocates one.
-                let session = within(self.timeouts.send, client.insert_native("", &sql))
-                    .await
-                    .map_err(|e| classify_error(&full, e))?;
+                let session = within(
+                    self.timeouts.send,
+                    client.insert_native_with("", &sql, DEDUP_TOKEN_SETTING, token.as_deref()),
+                )
+                .await
+                .map_err(|e| classify_error(&full, e))?;
                 if let Err(e) = check_server_types(&full, &columns, &session.server_columns) {
                     session.abort();
                     return Err(e);
@@ -430,6 +503,7 @@ impl DynamicInsert {
             }
         };
 
+        self.opened.push(shape.clone());
         self.active.push(Active {
             shape,
             columns,
@@ -533,6 +607,12 @@ impl DynamicInsert {
         };
 
         match sink {
+            OpenSink::HttpDefaults { insert, chunk } => {
+                chunk.resize(chunk.len() + columns.len(), 1);
+                if chunk.len() >= FLUSH_BYTES {
+                    send_chunk(insert, chunk, &full_name(database, table)).await?;
+                }
+            }
             OpenSink::Http { insert, chunk } => {
                 let start = chunk.len();
                 if let Err(e) = dynamic_row.encode_into(chunk) {
@@ -594,6 +674,10 @@ impl DynamicInsert {
         let full = self.full_table();
         match active.sink {
             OpenSink::Http {
+                mut insert,
+                mut chunk,
+            }
+            | OpenSink::HttpDefaults {
                 mut insert,
                 mut chunk,
             } => {
@@ -745,6 +829,18 @@ fn default_shape<'a>(
 /// Whether the row map or a raw passthrough carries `column`.
 fn supplies(row: &Map<String, Value>, raw_names: &[&str], column: &ColumnDef) -> bool {
     row.contains_key(&column.name) || raw_names.contains(&column.name.as_str())
+}
+
+/// The dedup token for one INSERT of a split batch: the caller's token, the
+/// defaulted columns the INSERT's rows supply, and how many INSERTs of that set
+/// came before it. A retry of the same batch derives the same tokens.
+fn split_token(token: &str, set: &[String], earlier: usize) -> String {
+    let set = set.join(",");
+    if earlier > 0 {
+        format!("{token}:[{set}]#{earlier}")
+    } else {
+        format!("{token}:[{set}]")
+    }
 }
 
 /// The `RowBinaryWithNamesAndTypes` header: the column count, every name, then
@@ -911,6 +1007,38 @@ mod tests {
         assert_eq!(names, ["id", "name", "_uuid", "_json", "e"]);
         let shape: Vec<bool> = default_shape(&obj, &[], &s).collect();
         assert_eq!(shape, [true, true], "_uuid and e only");
+    }
+
+    /// Each INSERT of a split batch gets its own token, and the same set at the
+    /// same position gets the same one on a retry.
+    #[test]
+    fn a_split_batch_derives_one_token_per_insert() {
+        let set =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|n| escape_ident(n)).collect() };
+        let cases = [
+            (set(&[]), 0, "t:[]"),
+            (set(&["d"]), 0, "t:[`d`]"),
+            (set(&["d", "e"]), 0, "t:[`d`,`e`]"),
+            (set(&[]), 1, "t:[]#1"),
+            (set(&["a,b"]), 0, "t:[`a,b`]"),
+        ];
+        let tokens: Vec<String> = cases
+            .iter()
+            .map(|(names, earlier, want)| {
+                let got = split_token("t", names, *earlier);
+                assert_eq!(got, *want);
+                assert_eq!(
+                    got,
+                    split_token("t", names, *earlier),
+                    "a retry derives it again"
+                );
+                got
+            })
+            .collect();
+        let mut distinct = tokens.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), tokens.len(), "{tokens:?}");
     }
 
     /// The header names the columns, then types them as the cached schema

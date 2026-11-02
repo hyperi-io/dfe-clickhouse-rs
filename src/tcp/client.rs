@@ -412,6 +412,41 @@ impl TcpClient {
         insert_native_via_pool(self.pool(), query_id, sql, &self.query_settings).await
     }
 
+    /// [`Self::insert_native`] with `name` set to `value` for this INSERT
+    /// alone, in place of any value the client carries. `None` sends the
+    /// client's settings unchanged.
+    #[cfg(feature = "dynamic")]
+    pub(crate) async fn insert_native_with(
+        &self,
+        query_id: &str,
+        sql: &str,
+        name: &str,
+        value: Option<&str>,
+    ) -> Result<TcpInsertSession> {
+        let Some(value) = value else {
+            return self.insert_native(query_id, sql).await;
+        };
+        let mut settings: Vec<(String, String)> = self
+            .query_settings
+            .iter()
+            .filter(|(n, _)| n != name)
+            .cloned()
+            .collect();
+        settings.push((name.to_string(), value.to_string()));
+        insert_native_via_pool(self.pool(), query_id, sql, &settings).await
+    }
+
+    /// The value of a setting added with [`Self::with_setting`], the last one
+    /// where it was added more than once.
+    #[cfg(feature = "dynamic")]
+    pub(crate) fn setting(&self, name: &str) -> Option<&str> {
+        self.settings
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    }
+
     /// Default rows per Native block on the insert path.
     pub const DEFAULT_INSERT_BLOCK_ROWS: u64 = client_ext::DEFAULT_TCP_INSERT_BLOCK_ROWS;
 

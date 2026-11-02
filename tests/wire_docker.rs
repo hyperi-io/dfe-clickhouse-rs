@@ -2767,6 +2767,123 @@ async fn a_changed_column_type_is_refused_as_drift_never_stored() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// A dedup token set on the client covers each INSERT a batch splits into on
+/// its own: rows carrying two sets of defaulted columns land whole, and a retry
+/// of the same batch lands nothing new.
+#[tokio::test]
+async fn a_dedup_token_covers_each_split_insert_on_its_own() {
+    const TOKEN: &str = "insert_deduplication_token";
+    const ROWS: [Option<&str>; 3] = [None, Some("given"), None];
+
+    require_docker!();
+    let _one = ONE_SERVER.acquire().await.unwrap();
+    let server = server().await;
+    let tcp = server.tcp();
+    tcp.execute("CREATE DATABASE IF NOT EXISTS wire")
+        .await
+        .unwrap();
+    let http_token = UnifiedClient::Http(
+        Client::default()
+            .with_url(format!("http://{}:{}", server.host, server.http_port))
+            .with_setting(TOKEN, "batch-1"),
+    );
+    let tcp_token = UnifiedClient::Tcp(
+        TcpClient::new(format!("{}:{}", server.host, server.native_port))
+            .with_setting(TOKEN, "batch-1"),
+    );
+
+    let want: Vec<&str> = ROWS.iter().map(|d| d.unwrap_or("dflt")).collect();
+    let mut failures = Vec::new();
+    for (name, client) in [("http", &http_token), ("tcp", &tcp_token)] {
+        let table = format!("dedup_{name}");
+        tcp.execute(&format!(
+            "CREATE OR REPLACE TABLE wire.{table} (n UInt32, d String DEFAULT 'dflt') \
+             ENGINE = MergeTree ORDER BY n SETTINGS non_replicated_deduplication_window = 100"
+        ))
+        .await
+        .unwrap();
+        for attempt in ["first", "retry"] {
+            match write_n_d(client, &table, &ROWS).await {
+                Ok(3) => {}
+                other => failures.push(format!("{name} {attempt} insert: {other:?}")),
+            }
+            let got = tcp
+                .fetch_columns(&format!("SELECT d FROM wire.{table} ORDER BY n"))
+                .await
+                .and_then(|c| c.get::<String>("d"));
+            if !got.as_ref().is_ok_and(|got| *got == want) {
+                failures.push(format!("{name} {attempt}: read {got:?}, wanted {want:?}"));
+            }
+        }
+    }
+
+    server.stop().await;
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Rows that supply no column of a table whose every column has a default
+/// land as the defaults over HTTP, alone, several at once, or beside a row
+/// that does supply one.
+#[tokio::test]
+async fn rows_of_only_defaults_land_as_the_defaults_over_http() {
+    use dfe_clickhouse::dynamic::DynamicSchemaCache;
+    use serde_json::{Map, Value, json};
+
+    require_docker!();
+    let _one = ONE_SERVER.acquire().await.unwrap();
+    let server = server().await;
+    let (tcp, http) = (server.tcp(), server.http());
+    tcp.execute("CREATE DATABASE IF NOT EXISTS wire")
+        .await
+        .unwrap();
+
+    let cases: [(&str, Vec<Value>, Vec<&str>); 3] = [
+        ("one", vec![json!({})], vec!["7 dflt"]),
+        ("several", vec![json!({}); 3], vec!["7 dflt"; 3]),
+        (
+            "mixed",
+            vec![json!({}), json!({"d": "x"}), json!({})],
+            vec!["7 dflt", "7 dflt", "7 x"],
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (case, rows, want) in &cases {
+        let table = format!("all_defaults_{case}");
+        tcp.execute(&format!(
+            "CREATE OR REPLACE TABLE wire.{table} (a UInt32 DEFAULT 7, d String DEFAULT 'dflt') \
+             ENGINE = MergeTree ORDER BY tuple()"
+        ))
+        .await
+        .unwrap();
+        let cache = DynamicSchemaCache::new(Duration::from_secs(60));
+        let mut insert = http.dynamic_insert("wire", &table, cache).await.unwrap();
+        let mut written = Ok(());
+        for row in rows {
+            let row: Map<String, Value> = row.as_object().unwrap().clone();
+            written = written.and(insert.write_map(&row).await);
+        }
+        let ended = match written {
+            Ok(()) => insert.end().await,
+            Err(e) => Err(e),
+        };
+        if !matches!(ended, Ok(n) if n == rows.len() as u64) {
+            failures.push(format!("{case}: insert {ended:?}"));
+        }
+        let got = tcp
+            .fetch_columns(&format!(
+                "SELECT concat(toString(a), ' ', d) AS s FROM wire.{table} ORDER BY s"
+            ))
+            .await
+            .and_then(|c| c.get::<String>("s"));
+        if !got.as_ref().is_ok_and(|got| got == want) {
+            failures.push(format!("{case}: read {got:?}, wanted {want:?}"));
+        }
+    }
+
+    server.stop().await;
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 /// A failover list must verify each endpoint against its own host. The
 /// certificate is valid for `localhost` alone, and `127.0.0.1` stands in for
 /// a second host that the certificate does not name.
