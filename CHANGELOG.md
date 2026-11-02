@@ -3,6 +3,12 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [0.1.10](https://github.com/hyperi-io/dfe-clickhouse-rs/compare/v0.1.9...v0.1.10) (2026-11-02)
+
+### Bug Fixes
+
+* **insert:** reject column type changes with cached schemas ([#42](https://github.com/hyperi-io/dfe-clickhouse-rs/issues/42)) ([b8462c9](https://github.com/hyperi-io/dfe-clickhouse-rs/commit/b8462c9d80ee552d247ed516e2f17b98f3ee9e1d))
+
 ## [0.1.9](https://github.com/hyperi-io/dfe-clickhouse-rs/compare/v0.1.8...v0.1.9) (2026-11-01)
 
 ### Bug Fixes
