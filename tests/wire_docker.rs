@@ -2487,7 +2487,8 @@ async fn write_n_d(
 
 /// A defaulted column takes the row's value where the row carries one and the
 /// server's default where it does not, whichever shape the first row has. Over
-/// HTTP the whole batch is still one INSERT.
+/// HTTP the batch is one INSERT per set of defaulted columns its rows carry,
+/// not one per change of set: three alternating rows are two INSERTs.
 #[tokio::test]
 async fn a_defaulted_column_is_kept_or_defaulted_row_by_row() {
     const ORDERS: [&[Option<&str>]; 2] = [
@@ -2503,8 +2504,8 @@ async fn a_defaulted_column_is_kept_or_defaulted_row_by_row() {
         .await
         .unwrap();
 
-    // A client default that would make the server write the type's zero for a
-    // flagged column instead of its DEFAULT expression.
+    // A client default that makes a reader fill a field the input omits with
+    // the type's zero rather than its DEFAULT expression.
     let http_defaults_off = UnifiedClient::Http(
         Client::default()
             .with_url(format!("http://{}:{}", server.host, server.http_port))
@@ -2552,9 +2553,9 @@ async fn a_defaulted_column_is_kept_or_defaulted_row_by_row() {
             ))
             .await
             .and_then(|c| c.get::<u64>("c"));
-        if !inserts.as_ref().is_ok_and(|c| *c == [1]) {
+        if !inserts.as_ref().is_ok_and(|c| *c == [2]) {
             failures.push(format!(
-                "{name} order {i}: INSERT count {inserts:?}, wanted 1"
+                "{name} order {i}: INSERT count {inserts:?}, wanted 2"
             ));
         }
     }
@@ -2656,6 +2657,226 @@ async fn a_transient_server_rejection_is_retriable_on_both_transports() {
         match write_n_d(client, &table, &[Some("second")]).await {
             Err(e) if e.is_retriable() && e.to_string().contains("252") => {}
             other => failures.push(format!("{name} second insert: {other:?}")),
+        }
+    }
+
+    server.stop().await;
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Write one `(n, v)` row through a dynamic insert that takes its schema from
+/// `cache`.
+async fn write_n_v(
+    client: &UnifiedClient,
+    table: &str,
+    cache: &std::sync::Arc<dfe_clickhouse::dynamic::DynamicSchemaCache>,
+    n: u32,
+    v: serde_json::Value,
+) -> Result<u64, dfe_clickhouse::dynamic::DynamicError> {
+    use serde_json::{Map, Value};
+
+    let mut insert = match client
+        .dynamic_insert("wire", table, std::sync::Arc::clone(cache))
+        .await
+    {
+        Ok(insert) => insert,
+        Err(dfe_clickhouse::Error::Dynamic(e)) => return Err(e),
+        Err(e) => panic!("{table}: opening the insert failed: {e}"),
+    };
+    let mut row = Map::new();
+    row.insert("n".to_string(), Value::from(n));
+    row.insert("v".to_string(), v);
+    insert.write_map(&row).await?;
+    insert.end().await
+}
+
+/// A column whose type changed under a cached schema is refused as schema
+/// drift, never stored, on both transports. The refusal drops the cached
+/// schema, and the re-read schema then refuses the value as a bad row.
+#[tokio::test]
+async fn a_changed_column_type_is_refused_as_drift_never_stored() {
+    use dfe_clickhouse::dynamic::{DynamicError, DynamicSchemaCache};
+    use serde_json::json;
+
+    // (case, cached type, new type, value): "abc" is a String whose bytes
+    // also read as a UInt32, and 300 is a UInt64 a cast to UInt8 wraps to 44.
+    let cases = [
+        ("reread", "String", "UInt32", json!("abc")),
+        ("narrowed", "UInt64", "UInt8", json!(300)),
+    ];
+
+    require_docker!();
+    let _one = ONE_SERVER.acquire().await.unwrap();
+    let server = server().await;
+    let (tcp, http) = (server.tcp(), server.http());
+    tcp.execute("CREATE DATABASE IF NOT EXISTS wire")
+        .await
+        .unwrap();
+
+    let mut failures = Vec::new();
+    for (name, client) in [("http", &http), ("tcp", &tcp)] {
+        for (case, cached, changed, value) in &cases {
+            let table = format!("drift_{name}_{case}");
+            let ddl = |ty: &str| {
+                format!(
+                    "CREATE OR REPLACE TABLE wire.{table} (n UInt32, v {ty}) \
+                     ENGINE = MergeTree ORDER BY n"
+                )
+            };
+            let cache = DynamicSchemaCache::new(Duration::from_secs(300));
+            tcp.execute(&ddl(cached)).await.unwrap();
+            let fill = if *cached == "String" {
+                json!("x")
+            } else {
+                json!(1)
+            };
+            if let Err(e) = write_n_v(client, &table, &cache, 0, fill).await {
+                failures.push(format!("{name} {case}: priming insert: {e}"));
+                continue;
+            }
+            tcp.execute(&ddl(changed)).await.unwrap();
+
+            match write_n_v(client, &table, &cache, 1, value.clone()).await {
+                Err(e @ DynamicError::SchemaMismatch { .. }) => {
+                    assert!(e.is_retriable(), "{name} {case}: {e}");
+                }
+                other => failures.push(format!("{name} {case}: stale insert: {other:?}")),
+            }
+            if cache.get(&format!("wire.{table}")).is_some() {
+                failures.push(format!("{name} {case}: the stale schema is still cached"));
+            }
+            match write_n_v(client, &table, &cache, 2, value.clone()).await {
+                Err(e @ DynamicError::EncodingError { .. }) => {
+                    assert!(!e.is_retriable(), "{name} {case}: {e}");
+                }
+                other => failures.push(format!("{name} {case}: re-read insert: {other:?}")),
+            }
+            let stored = tcp
+                .fetch_columns(&format!(
+                    "SELECT CAST(v AS String) AS s FROM wire.{table} ORDER BY n"
+                ))
+                .await
+                .and_then(|c| c.get::<String>("s"));
+            if !stored.as_ref().is_ok_and(Vec::is_empty) {
+                failures.push(format!("{name} {case}: stored {stored:?}, wanted nothing"));
+            }
+        }
+    }
+
+    server.stop().await;
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A dedup token set on the client covers each INSERT a batch splits into on
+/// its own: rows carrying two sets of defaulted columns land whole, and a retry
+/// of the same batch lands nothing new.
+#[tokio::test]
+async fn a_dedup_token_covers_each_split_insert_on_its_own() {
+    const TOKEN: &str = "insert_deduplication_token";
+    const ROWS: [Option<&str>; 3] = [None, Some("given"), None];
+
+    require_docker!();
+    let _one = ONE_SERVER.acquire().await.unwrap();
+    let server = server().await;
+    let tcp = server.tcp();
+    tcp.execute("CREATE DATABASE IF NOT EXISTS wire")
+        .await
+        .unwrap();
+    let http_token = UnifiedClient::Http(
+        Client::default()
+            .with_url(format!("http://{}:{}", server.host, server.http_port))
+            .with_setting(TOKEN, "batch-1"),
+    );
+    let tcp_token = UnifiedClient::Tcp(
+        TcpClient::new(format!("{}:{}", server.host, server.native_port))
+            .with_setting(TOKEN, "batch-1"),
+    );
+
+    let want: Vec<&str> = ROWS.iter().map(|d| d.unwrap_or("dflt")).collect();
+    let mut failures = Vec::new();
+    for (name, client) in [("http", &http_token), ("tcp", &tcp_token)] {
+        let table = format!("dedup_{name}");
+        tcp.execute(&format!(
+            "CREATE OR REPLACE TABLE wire.{table} (n UInt32, d String DEFAULT 'dflt') \
+             ENGINE = MergeTree ORDER BY n SETTINGS non_replicated_deduplication_window = 100"
+        ))
+        .await
+        .unwrap();
+        for attempt in ["first", "retry"] {
+            match write_n_d(client, &table, &ROWS).await {
+                Ok(3) => {}
+                other => failures.push(format!("{name} {attempt} insert: {other:?}")),
+            }
+            let got = tcp
+                .fetch_columns(&format!("SELECT d FROM wire.{table} ORDER BY n"))
+                .await
+                .and_then(|c| c.get::<String>("d"));
+            if !got.as_ref().is_ok_and(|got| *got == want) {
+                failures.push(format!("{name} {attempt}: read {got:?}, wanted {want:?}"));
+            }
+        }
+    }
+
+    server.stop().await;
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Rows that supply no column of a table whose every column has a default
+/// land as the defaults over HTTP, alone, several at once, or beside a row
+/// that does supply one.
+#[tokio::test]
+async fn rows_of_only_defaults_land_as_the_defaults_over_http() {
+    use dfe_clickhouse::dynamic::DynamicSchemaCache;
+    use serde_json::{Map, Value, json};
+
+    require_docker!();
+    let _one = ONE_SERVER.acquire().await.unwrap();
+    let server = server().await;
+    let (tcp, http) = (server.tcp(), server.http());
+    tcp.execute("CREATE DATABASE IF NOT EXISTS wire")
+        .await
+        .unwrap();
+
+    let cases: [(&str, Vec<Value>, Vec<&str>); 3] = [
+        ("one", vec![json!({})], vec!["7 dflt"]),
+        ("several", vec![json!({}); 3], vec!["7 dflt"; 3]),
+        (
+            "mixed",
+            vec![json!({}), json!({"d": "x"}), json!({})],
+            vec!["7 dflt", "7 dflt", "7 x"],
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (case, rows, want) in &cases {
+        let table = format!("all_defaults_{case}");
+        tcp.execute(&format!(
+            "CREATE OR REPLACE TABLE wire.{table} (a UInt32 DEFAULT 7, d String DEFAULT 'dflt') \
+             ENGINE = MergeTree ORDER BY tuple()"
+        ))
+        .await
+        .unwrap();
+        let cache = DynamicSchemaCache::new(Duration::from_secs(60));
+        let mut insert = http.dynamic_insert("wire", &table, cache).await.unwrap();
+        let mut written = Ok(());
+        for row in rows {
+            let row: Map<String, Value> = row.as_object().unwrap().clone();
+            written = written.and(insert.write_map(&row).await);
+        }
+        let ended = match written {
+            Ok(()) => insert.end().await,
+            Err(e) => Err(e),
+        };
+        if !matches!(ended, Ok(n) if n == rows.len() as u64) {
+            failures.push(format!("{case}: insert {ended:?}"));
+        }
+        let got = tcp
+            .fetch_columns(&format!(
+                "SELECT concat(toString(a), ' ', d) AS s FROM wire.{table} ORDER BY s"
+            ))
+            .await
+            .and_then(|c| c.get::<String>("s"));
+        if !got.as_ref().is_ok_and(|got| got == want) {
+            failures.push(format!("{case}: read {got:?}, wanted {want:?}"));
         }
     }
 

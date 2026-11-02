@@ -20,7 +20,7 @@ two.
 
 | Path | Format | Transport |
 |---|---|---|
-| `UnifiedClient::dynamic_insert` -> HTTP | RowBinaryWithDefaults | HTTP |
+| `UnifiedClient::dynamic_insert` -> HTTP | RowBinaryWithNamesAndTypes | HTTP |
 | `UnifiedClient::dynamic_insert` -> TCP | Native, columnar | native TCP |
 | `TcpClient::insert_native` | Native, columnar | native TCP |
 | `clickhouse::Client::insert::<T>` | RowBinary | HTTP (upstream, unchanged) |
@@ -33,7 +33,9 @@ same either way, and the server stops parsing text.
 Over native TCP the choice does not exist at all: the protocol accepts Native
 format and nothing else, which is a server constraint rather than a gap here.
 
-Over HTTP the INSERT names every column the server takes a value for, and each row flags the defaulted columns it omits, so the server fills those and a batch stays one INSERT. The insert sets `input_format_defaults_for_omitted_fields=1` itself, because with it off the server writes the type's zero in place of the DEFAULT expression, and a client default or user profile could otherwise turn it off. Native has no per-row default. A TCP INSERT names the required columns and the defaulted ones its first row supplies, and a later row that supplies a different set commits the rows so far and opens a new INSERT. A TCP batch whose rows vary that way becomes several INSERTs, and an error late in it can follow rows already committed. Retry the whole batch.
+Both formats check the cached schema against the table. The HTTP header declares each column's type, and the server refuses a type the table no longer has with code 117 (`INCORRECT_DATA`). The insert sets `input_format_with_types_use_header=1` itself, so a client default or user profile cannot turn that check off. Over TCP the server answers the INSERT with its own types, and the insert refuses a difference before sending a row. Without either check a stale schema's bytes are read as the new type: "abc" sent as a String lands in a UInt32 column as 1667391747, and 300 sent as a UInt64 lands in a UInt8 column as 44. Both refusals are `DynamicError::SchemaMismatch`, which drops the cached schema.
+
+Neither format has a per-row default. An INSERT names the required columns and the defaulted ones its rows supply, and the server fills the rest from their DEFAULT expressions. Rows that supply a different set go to another INSERT. Over HTTP up to four of those stay open at once, so a batch is one INSERT per set its rows carry. Over TCP a row that supplies a different set commits the rows so far and opens a new INSERT. A batch whose rows vary that way becomes several INSERTs, and an error late in it can follow rows already committed. Retry the whole batch. Where the client sets `insert_deduplication_token`, each INSERT gets that token plus the defaulted columns its rows supply, so the INSERTs do not suppress each other and a retry of the same rows in the same order lands once. A row that supplies no column at all, on a table whose every column has a default, goes over HTTP as `RowBinaryWithDefaults` with every column flagged, so no value crosses the wire.
 
 Both transports send once 1 MiB of rows is buffered, so a batch never sits whole in memory.
 

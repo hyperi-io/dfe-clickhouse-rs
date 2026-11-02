@@ -54,7 +54,7 @@ transports, which is why a `JSON` column reads identically over each.
 `dynamic_insert` resolves the schema through whichever transport is configured
 and returns a `DynamicInsert` bound to it. The TCP arm resolves the schema
 eagerly, because `DynamicInsert::tcp` needs it up front; the HTTP arm defers.
-Encoding is RowBinaryWithDefaults for HTTP and Native columnar for TCP, sharing the
+Encoding is RowBinaryWithNamesAndTypes for HTTP and Native columnar for TCP, sharing the
 encoder.
 
 A caller that holds its own client reads a schema with `fetch_dynamic_schema`
