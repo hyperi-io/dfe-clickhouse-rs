@@ -29,6 +29,7 @@ ignore = [
     { id = "RUSTSEC-2026-0404", reason = "DCtx::try_clone only, never called" },
     { id = "RUSTSEC-2026-0405", reason = "seekable::SeekableCStream only, and the seekable feature is off" },
     { id = "RUSTSEC-2026-0406", reason = "CCtx methods only. clickhouse builds no CCtx" },
+    { id = "RUSTSEC-2026-0440", reason = "astral-tokio-tar is unmaintained, not vulnerable. It arrives only through the testcontainers dev-dependency the wire tests use, and no release binary links it. testcontainers 0.28.0 still depends on it. Drop when testcontainers moves off it." },
 ]
 
 [licenses]
