@@ -67,6 +67,15 @@ use crate::tcp::{TcpClient, TcpInsertSession};
 /// columns on the wire.
 const JSON_AS_STRING_SETTING: &str = "input_format_binary_read_json_as_string";
 
+/// Server settings, set on every HTTP insert into JSON columns, that keep a
+/// date-like string at a JSON path a String. The server default stores it as
+/// `Date` or `DateTime`, which mixes types at a path that also carries strings.
+/// A Native insert's String-to-JSON cast ignores them.
+const NO_DATE_INFERENCE: [(&str, &str); 2] = [
+    ("input_format_try_infer_dates", "0"),
+    ("input_format_try_infer_datetimes", "0"),
+];
+
 /// The server setting that checks each header type against the table's.
 /// Set on every HTTP insert, so a client default or a user profile cannot turn
 /// the check off and let a stale type's bytes be read as the table's.
@@ -443,6 +452,9 @@ impl DynamicInsert {
                 }
                 if json_columns {
                     client = client.with_setting(JSON_AS_STRING_SETTING, "1");
+                    for (name, value) in NO_DATE_INFERENCE {
+                        client = client.with_setting(name, value);
+                    }
                 }
                 if defaults_only {
                     let insert = client
