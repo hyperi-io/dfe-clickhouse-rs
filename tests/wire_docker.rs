@@ -1003,6 +1003,57 @@ async fn a_json_path_that_changes_type_between_rows_reads_back() {
     assert_eq!(docs, [r#"{"a":"x"}"#, r#"{"a":1}"#, r#"{"a":[1,2]}"#]);
 }
 
+/// A date-like string in a JSON document is stored as String over HTTP. The
+/// server's default inference stores it as `Date` or `DateTime`, so a path that
+/// also carries other strings mixes types and string comparisons on it fail.
+///
+/// The Native insert still infers: its String-to-JSON cast ignores the query's
+/// inference settings, so the TCP row is pinned as `Date` until that changes.
+#[tokio::test]
+async fn a_date_like_json_string_stays_a_string() {
+    use dfe_clickhouse::dynamic::DynamicSchemaCache;
+    use serde_json::{Map, json};
+
+    require_docker!();
+    let _one = ONE_SERVER.acquire().await.unwrap();
+    let server = server().await;
+    let (tcp, http) = (server.tcp(), server.http());
+    tcp.execute("CREATE DATABASE IF NOT EXISTS wire")
+        .await
+        .unwrap();
+    tcp.execute(
+        "CREATE OR REPLACE TABLE wire.dates (n UInt32, d JSON) ENGINE = MergeTree ORDER BY n",
+    )
+    .await
+    .unwrap();
+
+    for (n, client) in [(0_u32, &http), (1, &tcp)] {
+        let cache = DynamicSchemaCache::new(Duration::from_secs(60));
+        let mut insert = client.dynamic_insert("wire", "dates", cache).await.unwrap();
+        let mut row = Map::new();
+        row.insert("n".to_string(), json!(n));
+        row.insert(
+            "d".to_string(),
+            json!({"day": "2024-01-15", "at": "2024-01-15 10:00:00"}),
+        );
+        insert.write_map(&row).await.expect("the row encodes");
+        insert.end().await.expect("the insert commits");
+    }
+
+    let read = tcp
+        .fetch_columns(
+            "SELECT CAST(dynamicType(d.day) AS String) AS day, \
+             CAST(dynamicType(d.at) AS String) AS at FROM wire.dates ORDER BY n",
+        )
+        .await;
+    server.stop().await;
+
+    let read = read.expect("the path types read back");
+    // One row per transport: HTTP first, then TCP.
+    assert_eq!(read.get::<String>("day").unwrap(), ["String", "Date"]);
+    assert_eq!(read.get::<String>("at").unwrap(), ["String", "DateTime"]);
+}
+
 /// The JSON serialisation this crate does NOT decode, pinned as the clean
 /// error it is rather than left to surprise someone.
 ///
