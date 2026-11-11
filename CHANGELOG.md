@@ -3,6 +3,13 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [0.1.11](https://github.com/hyperi-io/dfe-clickhouse-rs/compare/v0.1.10...v0.1.11) (2026-11-11)
+
+### Bug Fixes
+
+* **deps:** ignore the astral-tokio-tar unmaintained advisory ([32d0ea2](https://github.com/hyperi-io/dfe-clickhouse-rs/commit/32d0ea20fa3812f549fe6895a6aae68115af019c))
+* **dynamic:** keep date-like JSON strings as String on HTTP inserts ([b01635a](https://github.com/hyperi-io/dfe-clickhouse-rs/commit/b01635af2742cbfedb7e446ccada9dc3d517e2d1))
+
 ## [0.1.10](https://github.com/hyperi-io/dfe-clickhouse-rs/compare/v0.1.9...v0.1.10) (2026-11-02)
 
 ### Bug Fixes
