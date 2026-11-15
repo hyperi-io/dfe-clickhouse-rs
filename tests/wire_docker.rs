@@ -13,8 +13,8 @@
 //! failure here is this crate's decoder rather than its encoder; the encoder
 //! is covered separately, and by one test that uses the server as its oracle.
 //!
-//! None of these is `#[ignore]`d. `hyperi-ci` runs `cargo nextest` with no way
-//! to pass `--run-ignored`, so an ignored test here is one CI never runs.
+//! None of these is `#[ignore]`d. CI runs `hyperi-ci`'s core test tier, which
+//! skips ignored tests, so an ignored test here is one CI never runs.
 //! Without a container runtime they fail under `$CI` and skip with a message
 //! anywhere else.
 //!
@@ -2138,6 +2138,10 @@ const DFE_TYPES: &[DfeType] = &[
         &[(r#"[{"k":"v"}]"#, "[{'k':'v'}]")],
     ),
     reads("Array(JSON)", &[(r#"[{"a":1}]"#, r#"['{"a":1}']"#)]),
+    reads(
+        "Map(String, JSON)",
+        &[(r#"{"k":{"a":1}}"#, r#"{'k':'{"a":1}'}"#)],
+    ),
     reads(
         "JSON(`a.b` UInt32)",
         &[(r#"{"a":{"b":1},"c":"x"}"#, r#"{"a":{"b":1},"c":"x"}"#)],

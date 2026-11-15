@@ -1,10 +1,8 @@
 # Column type support
 
-What the Native codec reads and writes. Every type listed as supported is
-round-tripped against a real ClickHouse in `tests/wire_docker.rs`, on both
-transports, with the server building the values.
+What the Native codec reads and writes. Every type listed as supported is read back from a real ClickHouse in `tests/wire_docker.rs`, on both transports, with the server building the values. The exceptions are `Time` and `Time64`, which decode as signed seconds and signed ticks at the column's precision but have no row in that matrix.
 
-## Scalars
+## Scalars and strings
 
 `UInt8` through `UInt256`, `Int8` through `Int256`, `Float32`, `Float64`,
 `BFloat16`, `Decimal32/64/128/256`, `Date`, `Date32`, `DateTime`,
@@ -14,7 +12,7 @@ transports, with the server building the values.
 Enum ordinals are signed: `Enum8` decodes as `Int8` and `Enum16` as `Int16`,
 so a negative ordinal reads back as itself rather than as its unsigned byte.
 
-## Strings
+A runtime-schema insert takes a `Point` in any form Elasticsearch takes a `geo_point`: `[lon, lat]`, `{"lat", "lon"}`, a GeoJSON point, `"lat,lon"` or WKT `POINT (lon lat)`, with longitude as x. A latitude past 90 or a longitude past 180 is refused, and so is a geohash.
 
 `String` (varuint length then bytes -- ClickHouse strings are bytes, not
 guaranteed UTF-8) and `FixedString(N)` (N raw bytes on the wire).
@@ -29,16 +27,15 @@ column's data, which is where `NativeWriter` puts them. Reading them inline
 works until an enclosing type writes data of its own first, so
 `Array(LowCardinality(String))` and friends need the phased form.
 
+`Ring`, `LineString`, `Polygon`, `MultiLineString` and `MultiPolygon` read and insert as the arrays of `Point` they are on the wire.
+
+Reads refuse `AggregateFunction`, a named `Tuple` such as `Tuple(a UInt8, b String)`, and the `Interval` types by name. They refuse a `Nested` column too, which the server keeps only under `flatten_nested = 0`. Under the default `flatten_nested = 1` it splits a `Nested` column into one `Array` per field, and those read. A runtime-schema insert refuses `Tuple`, `Variant` and `Dynamic`.
+
 ## Semi-structured
 
-`Variant(T1..Tn)`, `Dynamic` and `JSON` all decode to their per-row document
-text. `Object('json')` is the deprecated type and reads as a plain String.
+`Variant(T1..Tn)`, `Dynamic` and `JSON` all decode to their per-row document text. `Object('json')`, the type `JSON` replaced, reads as a plain String from a server old enough to still have it.
 
-A `JSON` column travels as `String` in both directions: an insert declares it
-`String` and the server converts, and every query asks for
-`output_format_native_write_json_as_string=1` so it comes back as text. That
-holds at any depth, so `Nullable(JSON)`, `Array(JSON)` and `Map(K, JSON)`
-insert too.
+A `JSON` value travels as text in both directions. An insert sends it as a string, declared `String` over TCP and read as one over HTTP under `input_format_binary_read_json_as_string`, and the server converts. Every query asks for `output_format_native_write_json_as_string=1` by default, so it comes back as text. That holds at any depth, so `Nullable(JSON)`, `Array(JSON)` and `Map(K, JSON)` insert too.
 
 `JSON(max_dynamic_paths=N, max_dynamic_types=N, SKIP path, SKIP REGEXP 're')`
 and typed paths such as ``JSON(`a.b` UInt32)`` read and insert like plain
@@ -49,10 +46,7 @@ it, for `Bool`, integers up to 64 bits, `Float32`, `Float64`, `String` and
 arrays of them. Any other type (a date or time, a decimal, a UUID), and a
 `Dynamic` value stored past `max_types` (`SharedVariant`), fails the query with
 `Error::Unsupported` naming the column, over native TCP and over HTTP through
-`UnifiedClient`. The error says to read the column cast to String in the query,
-as `CAST(d AS String)`. A nested `Dynamic` in the flattened serialisation is
-refused too. `dynamic_and_variant_values_print_like_the_server_or_refuse`
-pins each.
+`UnifiedClient`. The error says to read the column cast to String in the query, as `CAST(d AS String)`. A nested `Dynamic` in the flattened serialisation is refused too. `dynamic_and_variant_values_print_like_the_server_or_refuse` pins `Bool`, `Int64`, `Float32` and `String` values and the date and time refusals.
 
 Two limits worth knowing before sending data:
 
@@ -93,37 +87,12 @@ Where it would print something the server would not, the read fails with
 
 ## Sparse columns
 
-Wired and proved live. A column whose defaults pass
-`ratio_of_defaults_for_sparse_serialization` arrives as an offset list plus
-only the non-default values, and the decoder scatters it back to the block's
-full length. The server sparse-serialises scalars, `Nullable` (whose sparse
-values carry no null map), and each element of a `Tuple` on its own. Any other
-composite arriving that way is refused by name.
+A column whose defaults pass `ratio_of_defaults_for_sparse_serialization` arrives as an offset list plus only the non-default values, and the decoder scatters it back to the block's full length. `tests/wire_docker.rs` stores each shape sparse and dense on the pinned server and checks both read the same over TCP.
 
-The header that selects it is TWO bytes, not one, and the second is easy to
-miss: `NativeWriter` writes the `has_custom_serialization` bool, then, only
-when it is set, a byte naming the kind stack (0 Default, 1 Sparse, 2 Detached,
-3 Detached-over-Sparse, 4 Replicated, 5 a combination with its own varuint
-count). Reading the flag alone and treating 1 as "sparse" leaves the kind byte
-on the wire; one byte of drift then corrupts every following column and
-surfaces as an unknown packet id nowhere near the cause. A `Tuple` (and
-`Point`) writes its own kind byte and then every element's, recursively, so
-`Tuple(UInt64, String)` with both elements sparse is `01 00 01 01`. Only
-Default and Sparse are decoded, and the rest are refused by name.
+The server stores scalars that way, and each element of a `Tuple` on its own. A `Nullable` is sparse only under `nullable_serialization_version = 'allow_sparse'`, and its sparse values carry no null map. `LowCardinality` and `Array` columns never are. A composite marked sparse as a whole is refused, naming its type.
 
-A TCP read has a default timeout on the gap between packets
-(`TcpClient::with_read_timeout`), so a stalled decode returns an error rather
-than hanging the caller.
+The header that selects it is TWO bytes, not one, and the second is easy to miss: `NativeWriter` writes the `has_custom_serialization` bool, then, only when it is set, a byte naming the kind stack (0 Default, 1 Sparse, 2 Detached, 3 Detached-over-Sparse, 4 Replicated, 5 a combination with its own varuint count). Reading the flag alone and treating 1 as "sparse" leaves the kind byte on the wire. That one byte of drift corrupts every following column and surfaces as an unknown packet id nowhere near the cause.
 
-## Not implemented
+A `Tuple` (and `Point`) writes its own kind byte and then every element's, recursively, so `Tuple(UInt64, String)` with both elements sparse is `01 00 01 01`. Only Default and Sparse are decoded, and the rest are refused by name.
 
-`AggregateFunction`, `Nested` (decomposes as `Array(Tuple)`).
-
-`Ring`, `LineString`, `Polygon`, `MultiLineString` and `MultiPolygon` read and
-insert as the arrays of `Point` they are on the wire.
-
-A runtime-schema insert also refuses `Tuple`, `Variant` and `Dynamic`. It
-takes a `Point` in any form Elasticsearch takes a `geo_point`: `[lon, lat]`,
-`{"lat", "lon"}`, a GeoJSON point, `"lat,lon"` or WKT `POINT (lon lat)`, with
-longitude as x. A latitude past 90 or a longitude past 180 is refused, and so
-is a geohash.
+A TCP read has a default timeout on the gap between packets (`TcpClient::with_read_timeout`), so a stalled decode returns an error rather than hanging the caller.
