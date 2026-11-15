@@ -772,9 +772,18 @@ enum Serialization {
 /// `Point` is a `Tuple(Float64, Float64)` on the server, kind stacks included.
 const POINT_FIELDS: [ColumnType; 2] = [ColumnType::Float64, ColumnType::Float64];
 
+/// `col_type` with its `SimpleAggregateFunction` wrappers removed: the server
+/// serialises the wrapped type, kind stacks included.
+fn unwrapped(mut col_type: &ColumnType) -> &ColumnType {
+    while let ColumnType::SimpleAggregateFunction(inner) = col_type {
+        col_type = inner;
+    }
+    col_type
+}
+
 /// The element types of a column the server serialises as a `Tuple`.
 fn tuple_fields(col_type: &ColumnType) -> Option<&[ColumnType]> {
-    match col_type {
+    match unwrapped(col_type) {
         ColumnType::Tuple(fields) => Some(fields),
         ColumnType::Point => Some(&POINT_FIELDS),
         _ => None,
@@ -998,7 +1007,7 @@ fn decode_serialized<'a, R: ClickHouseRead + 'a>(
                 let positions =
                     crate::native::sparse::read_sparse_offsets(r, rows, &mut state).await?;
                 let present = u64::try_from(positions.len()).unwrap_or(u64::MAX);
-                let dense = match col_type {
+                let dense = match unwrapped(col_type) {
                     // `SerializationSparse` sends a Nullable's values with no
                     // null map: every value on the wire is non-null.
                     ColumnType::Nullable(inner) => DecodedColumn::Nullable {
@@ -2341,6 +2350,27 @@ mod tests {
                     Float64(vec![0.0, 1.5, 0.0, 2.5, 0.0]),
                     Float64(vec![1.0; 5]),
                 ]),
+            ),
+            (
+                "SimpleAggregateFunction(any, Tuple(Nullable(UInt8), UInt8))",
+                &[0, 1, 0],
+                [&sparse_u8[..], &dense_u8[..]].concat(),
+                Tuple(vec![
+                    Nullable {
+                        mask: vec![1, 0, 1, 0, 1],
+                        child: Box::new(scattered()),
+                    },
+                    UInt8(dense_u8.to_vec()),
+                ]),
+            ),
+            (
+                "Tuple(SimpleAggregateFunction(any, Nullable(UInt8)))",
+                &[0, 1],
+                sparse_u8.clone(),
+                Tuple(vec![Nullable {
+                    mask: vec![1, 0, 1, 0, 1],
+                    child: Box::new(scattered()),
+                }]),
             ),
             // A Tuple's own Sparse kind is dropped by the server: the body is dense.
             (

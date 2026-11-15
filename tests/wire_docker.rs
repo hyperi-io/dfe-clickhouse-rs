@@ -1745,6 +1745,16 @@ const SPARSE_CASES: &[SparseCase] = &[
         "(0, (0, ''))",
         &["Sparse", "Sparse", "Sparse", "Sparse"],
     ),
+    // The wrapper is transparent on the wire, kind stacks included.
+    SparseCase {
+        settings: ", nullable_serialization_version = 'allow_sparse'",
+        ..sparse(
+            "SimpleAggregateFunction(any, Tuple(Nullable(UInt64), String))",
+            "(42, 'x')",
+            "(nullIf(number * 0, 0), '')",
+            &["Sparse", "Sparse", "Sparse"],
+        )
+    },
     sparse(
         "Array(Tuple(UInt64, String))",
         "[(42, 'x')]",
