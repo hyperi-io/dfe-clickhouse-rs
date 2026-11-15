@@ -1680,68 +1680,198 @@ async fn typed_path_json_round_trips_in_string_mode() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// A `MergeTree` column that is almost all defaults, merged into one part, is
-/// stored with sparse serialisation. Real tables look like this.
-///
-/// Passing does not prove the sparse form reached the wire: the server may
-/// have materialised the column before sending. Proving the wire form needs
-/// the custom-serialization flag observed rather than the values alone.
-#[tokio::test]
-async fn a_sparse_column_reads_back_on_both_transports() {
-    const TOTAL: &str = "SELECT sum(c) AS total FROM wire.sparse";
-    // The column itself, where the sparse serialisation reaches the wire
-    // rather than being collapsed by an aggregate.
-    const RAW: &str = "SELECT c FROM wire.sparse ORDER BY n LIMIT 6000";
+/// One sparse-matrix row: a column of 10,000 rows that is `default` except at
+/// row 5,000, which is `value`.
+struct SparseCase {
+    ch_type: &'static str,
+    value: &'static str,
+    default: &'static str,
+    /// Extra `MergeTree` settings for the sparse table.
+    settings: &'static str,
+    /// `system.parts_columns` serialisations of the column's subcolumns, or of
+    /// the column itself where it has none, after the merge.
+    stored: &'static [&'static str],
+    /// `None` reads the same as the dense copy. `Some(text)` is an error
+    /// containing `text`, never a timeout.
+    refused: Option<&'static str>,
+}
 
+const fn sparse(
+    ch_type: &'static str,
+    value: &'static str,
+    default: &'static str,
+    stored: &'static [&'static str],
+) -> SparseCase {
+    SparseCase {
+        ch_type,
+        value,
+        default,
+        settings: "",
+        stored,
+        refused: None,
+    }
+}
+
+const SPARSE_CASES: &[SparseCase] = &[
+    sparse("UInt64", "42", "0", &["Sparse"]),
+    sparse(
+        "Tuple(UInt64, String)",
+        "(42, 'x')",
+        "(0, '')",
+        &["Sparse", "Sparse", "Sparse"],
+    ),
+    // The Nullable element stays dense: the default nullable serialisation
+    // has no sparse form.
+    sparse(
+        "Tuple(Nullable(UInt64), String)",
+        "(42, 'x')",
+        "(if(number % 2 = 0, NULL, 0), '')",
+        &["Default", "Default", "Sparse", "Sparse"],
+    ),
+    SparseCase {
+        settings: ", nullable_serialization_version = 'allow_sparse'",
+        ..sparse(
+            "Tuple(Nullable(UInt64), String)",
+            "(42, 'x')",
+            // A NULL built per row, so the value under it is 0 in the dense
+            // copy too rather than whatever the constant-NULL branch leaves.
+            "(nullIf(number * 0, 0), '')",
+            &["Sparse", "Sparse", "Sparse"],
+        )
+    },
+    sparse(
+        "Tuple(UInt64, Tuple(UInt64, String))",
+        "(42, (7, 'x'))",
+        "(0, (0, ''))",
+        &["Sparse", "Sparse", "Sparse", "Sparse"],
+    ),
+    // The wrapper is transparent on the wire, kind stacks included.
+    SparseCase {
+        settings: ", nullable_serialization_version = 'allow_sparse'",
+        ..sparse(
+            "SimpleAggregateFunction(any, Tuple(Nullable(UInt64), String))",
+            "(42, 'x')",
+            "(nullIf(number * 0, 0), '')",
+            &["Sparse", "Sparse", "Sparse"],
+        )
+    },
+    sparse(
+        "Array(Tuple(UInt64, String))",
+        "[(42, 'x')]",
+        "[(0, '')]",
+        &["Default", "Default", "Default", "Default"],
+    ),
+    SparseCase {
+        refused: Some("unknown column type"),
+        ..sparse(
+            "Tuple(a UInt64, b String)",
+            "(42, 'x')",
+            "(0, '')",
+            &["Sparse", "Sparse", "Sparse"],
+        )
+    },
+];
+
+/// A `MergeTree` column that is almost all defaults, merged into one part, is
+/// stored sparse, and a `Tuple` stores each element sparse on its own. Real
+/// tables look like this: the server's default ratio is 0.9375.
+///
+/// The oracle is the same rows stored dense and read over the same transport,
+/// so the only difference between the two reads is the serialisation.
+#[tokio::test]
+async fn sparse_columns_read_the_same_as_dense_ones() {
     require_docker!();
     let _one = ONE_SERVER.acquire().await.unwrap();
     let server = server().await;
-    let client = server.tcp();
-    client
-        .execute("CREATE DATABASE IF NOT EXISTS wire")
-        .await
-        .unwrap();
-    // The server default ratio is 0.9375 and the table sets 0.9. One non-default
-    // row in 10,000 passes either.
-    client
-        .execute(
-            "CREATE OR REPLACE TABLE wire.sparse (n UInt64, c UInt64) \
-             ENGINE = MergeTree ORDER BY n \
-             SETTINGS ratio_of_defaults_for_sparse_serialization = 0.9",
-        )
-        .await
-        .unwrap();
-    client
-        .execute(
-            "INSERT INTO wire.sparse \
-             SELECT number, if(number = 5000, 42, 0) FROM system.numbers LIMIT 10000",
-        )
-        .await
-        .unwrap();
-    client
-        .execute("OPTIMIZE TABLE wire.sparse FINAL")
+    // Short enough that a decoder waiting on bytes the server never sends
+    // fails this test rather than stalling it.
+    let tcp = UnifiedClient::Tcp(
+        TcpClient::new(format!("{}:{}", server.host, server.native_port))
+            .with_read_timeout(Some(Duration::from_secs(20))),
+    );
+    tcp.execute("CREATE DATABASE IF NOT EXISTS wire")
         .await
         .unwrap();
 
-    let over_tcp = client.fetch_columns(TOTAL).await.expect("tcp reads it");
-    let over_http = server
-        .http()
-        .fetch_columns(TOTAL)
-        .await
-        .expect("http reads it");
-    let values = client
-        .fetch_columns(RAW)
-        .await
-        .expect("tcp reads the column")
-        .get::<u64>("c")
-        .unwrap();
+    let mut failures = Vec::new();
+    for (i, case) in SPARSE_CASES.iter().enumerate() {
+        if let Err(e) = run_sparse_case(&tcp, case, i).await {
+            failures.push(format!("{}{}: {e}", case.ch_type, case.settings));
+        }
+    }
 
     server.stop().await;
-    assert_eq!(over_tcp.get::<u64>("total").unwrap(), [42]);
-    assert_eq!(over_http.get::<u64>("total").unwrap(), [42]);
-    assert_eq!(values.len(), 6000);
-    assert_eq!(values[5000], 42, "the one non-default row");
-    assert_eq!(values[0], 0);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Store one case sparse and dense, merge both, and read both back.
+async fn run_sparse_case(
+    tcp: &UnifiedClient,
+    case: &SparseCase,
+    index: usize,
+) -> Result<(), String> {
+    let (sparse, dense) = (format!("sparse{index}"), format!("dense{index}"));
+    for (table, ratio, settings) in [(&sparse, "0.9", case.settings), (&dense, "1", "")] {
+        for sql in [
+            format!(
+                "CREATE OR REPLACE TABLE wire.{table} (n UInt64, c {}) \
+                 ENGINE = MergeTree ORDER BY n \
+                 SETTINGS ratio_of_defaults_for_sparse_serialization = {ratio}{settings}",
+                case.ch_type
+            ),
+            format!(
+                "INSERT INTO wire.{table} \
+                 SELECT number, if(number = 5000, {}, {}) FROM numbers(10000)",
+                case.value, case.default
+            ),
+            format!("OPTIMIZE TABLE wire.{table} FINAL"),
+        ] {
+            tcp.execute(&sql)
+                .await
+                .map_err(|e| format!("{sql} rejected: {e}"))?;
+        }
+    }
+
+    let stored = tcp
+        .fetch_columns(&format!(
+            "SELECT arrayStringConcat(if(empty(subcolumns.serializations), \
+             [serialization_kind], subcolumns.serializations), ',') AS s \
+             FROM system.parts_columns \
+             WHERE active AND database = 'wire' AND table = '{sparse}' AND column = 'c'"
+        ))
+        .await
+        .map_err(|e| format!("parts_columns read failed: {e}"))?
+        .get::<String>("s")
+        .map_err(|e| format!("parts_columns shape: {e}"))?;
+    if stored != [case.stored.join(",")] {
+        return Err(format!("stored {stored:?}, expected {:?}", case.stored));
+    }
+
+    // One thread keeps the single part's rows in one block, in order.
+    let read = |table: &str| format!("SELECT c FROM wire.{table} SETTINGS max_threads = 1");
+    match (tcp.fetch_columns(&read(&sparse)).await, case.refused) {
+        (Err(e), Some(want)) if e.to_string().contains(want) => Ok(()),
+        (Err(e), _) => Err(format!("sparse SELECT failed: {e}")),
+        (Ok(_), Some(want)) => Err(format!("read it -- expected an error with {want:?}")),
+        (Ok(over_sparse), None) => {
+            let over_dense = tcp
+                .fetch_columns(&read(&dense))
+                .await
+                .map_err(|e| format!("dense SELECT failed: {e}"))?;
+            let (s, d) = (rendered(&over_sparse, "c")?, rendered(&over_dense, "c")?);
+            match s.bytes().zip(d.bytes()).position(|(a, b)| a != b) {
+                None if s.len() == d.len() => Ok(()),
+                at => {
+                    let at = at.unwrap_or(s.len().min(d.len())).saturating_sub(40);
+                    Err(format!(
+                        "sparse {:?} != dense {:?}",
+                        s.get(at..at + 120),
+                        d.get(at..at + 120)
+                    ))
+                }
+            }
+        }
+    }
 }
 
 /// A result set the server splits into several blocks must read back whole

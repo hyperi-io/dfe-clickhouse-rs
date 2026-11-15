@@ -87,8 +87,12 @@ Where it would print something the server would not, the read fails with
 
 ## Sparse columns
 
-A column whose defaults pass `ratio_of_defaults_for_sparse_serialization` arrives as an offset list plus only the non-default values, and the decoder scatters it back to the block's full length. `tests/wire_docker.rs` reads a sparse-stored column back raw over TCP, and its `sum` over both transports. Passing does not prove the sparse form reached the wire, because the server may materialise the column before sending it.
+A column whose defaults pass `ratio_of_defaults_for_sparse_serialization` arrives as an offset list plus only the non-default values, and the decoder scatters it back to the block's full length. `tests/wire_docker.rs` stores each shape sparse and dense on the pinned server and checks both read the same over TCP.
 
-The server stores scalars that way, and the elements of a `Tuple`, but not a `Nullable`, `LowCardinality` or `Array` column. Over native TCP a `Tuple` whose elements arrive sparse stalls the read, a defect being fixed in [#46](https://github.com/hyperi-io/dfe-clickhouse-rs/issues/46): the query fails with `Error::TimedOut` only where `with_read_timeout` is set. HTTP reads it. A composite marked sparse as a whole is refused, naming its type.
+The server stores scalars that way, and each element of a `Tuple` on its own. A `Nullable` is sparse only under `nullable_serialization_version = 'allow_sparse'`, and its sparse values carry no null map. `LowCardinality` and `Array` columns never are. A composite marked sparse as a whole is refused, naming its type.
 
-The header that selects it is TWO bytes, not one, and the second is easy to miss: `NativeWriter` writes the `has_custom_serialization` bool, then, only when it is set, a byte naming the kind stack (0 Default, 1 Sparse, 2 Detached, 3 Detached-over-Sparse, 4 Replicated, 5 a combination with its own varuint count). Reading the flag alone and treating 1 as "sparse" leaves the kind byte on the wire. That one byte of drift corrupts every following column and surfaces as an unknown packet id nowhere near the cause. Only Default and Sparse are decoded, and the rest are refused by name.
+The header that selects it is TWO bytes, not one, and the second is easy to miss: `NativeWriter` writes the `has_custom_serialization` bool, then, only when it is set, a byte naming the kind stack (0 Default, 1 Sparse, 2 Detached, 3 Detached-over-Sparse, 4 Replicated, 5 a combination with its own varuint count). Reading the flag alone and treating 1 as "sparse" leaves the kind byte on the wire. That one byte of drift corrupts every following column and surfaces as an unknown packet id nowhere near the cause.
+
+A `Tuple` (and `Point`) writes its own kind byte and then every element's, recursively, so `Tuple(UInt64, String)` with both elements sparse is `01 00 01 01`. Only Default and Sparse are decoded, and the rest are refused by name.
+
+A TCP read has a default timeout on the gap between packets (`TcpClient::with_read_timeout`), so a stalled decode returns an error rather than hanging the caller.

@@ -313,9 +313,9 @@ impl DecodedColumn {
     /// the row the `i`th of them belongs to. Everything else is the type's
     /// default, which on the wire means zero, empty, or the epoch.
     ///
-    /// ClickHouse sparse-serialises scalars only, so a composite arriving this
-    /// way is a wire the decoder does not understand and says so rather than
-    /// guessing.
+    /// ClickHouse sparse-serialises scalars and `Nullable` only, so any other
+    /// composite arriving this way is a wire the decoder does not understand
+    /// and says so rather than guessing.
     ///
     /// # Errors
     ///
@@ -416,6 +416,11 @@ impl DecodedColumn {
                 timezone,
                 values: scatter_values(values, positions, num_rows, 0i64, budget)?,
             },
+            // A Nullable's default is NULL, so every row the wire skipped is null.
+            Self::Nullable { mask, child } => Self::Nullable {
+                mask: scatter_values(mask, positions, num_rows, 1u8, budget)?,
+                child: Box::new(child.expand_sparse(positions, num_rows, budget)?),
+            },
             Self::FixedString { width, bytes } => {
                 // Both factors are wire-derived, so the product is checked --
                 // a release build wraps it and then indexes past the buffer.
@@ -444,7 +449,6 @@ impl DecodedColumn {
     /// Variant name for an error message.
     fn type_label(&self) -> &'static str {
         match self {
-            Self::Nullable { .. } => "a Nullable column",
             Self::Array { .. } => "an Array column",
             Self::LowCardinality { .. } => "a LowCardinality column",
             Self::Tuple(_) => "a Tuple column",
@@ -756,31 +760,97 @@ pub(crate) async fn read_block_info<R: ClickHouseRead>(r: &mut R) -> Result<()> 
     Ok(())
 }
 
-/// Read a column's custom-serialization header and report whether it is sparse.
+/// How the server serialised one column, as its `SerializationInfo` says.
+#[derive(Debug)]
+enum Serialization {
+    Dense,
+    Sparse,
+    /// One entry per element: `SerializationInfoTuple` gives each its own kind.
+    Tuple(Vec<Serialization>),
+}
+
+/// `Point` is a `Tuple(Float64, Float64)` on the server, kind stacks included.
+const POINT_FIELDS: [ColumnType; 2] = [ColumnType::Float64, ColumnType::Float64];
+
+/// `col_type` with its `SimpleAggregateFunction` wrappers removed: the server
+/// serialises the wrapped type, kind stacks included.
+fn unwrapped(mut col_type: &ColumnType) -> &ColumnType {
+    while let ColumnType::SimpleAggregateFunction(inner) = col_type {
+        col_type = inner;
+    }
+    col_type
+}
+
+/// The element types of a column the server serialises as a `Tuple`.
+fn tuple_fields(col_type: &ColumnType) -> Option<&[ColumnType]> {
+    match unwrapped(col_type) {
+        ColumnType::Tuple(fields) => Some(fields),
+        ColumnType::Point => Some(&POINT_FIELDS),
+        _ => None,
+    }
+}
+
+/// Read a column's custom-serialization header.
 ///
-/// TWO bytes, not one. `NativeWriter::write` writes the `has_custom_serialization`
-/// bool, and then -- only when it is set -- `SerializationInfo::serialializeKindStackBinary`
-/// writes a SECOND byte naming the kind stack. Reading the flag alone and
-/// treating 1 as "sparse" leaves the kind byte on the wire, and one byte of
-/// drift turns the next column's offsets into garbage; the symptom is an
-/// "unknown server packet id" several columns later, nowhere near the cause.
+/// `NativeWriter::write` writes the `has_custom_serialization` bool, and only
+/// when it is set does `serialializeKindStackBinary` write the kind stacks:
+/// one byte for most types, but for a `Tuple` its own byte and then every
+/// element's, recursively (`SerializationInfoTuple.cpp`). A stack left unread
+/// misaligns every byte after it, and a misaligned length waits for data the
+/// server never sends.
+async fn read_serialization<R: ClickHouseRead>(
+    r: &mut R,
+    name: &str,
+    col_type: &ColumnType,
+) -> Result<Serialization> {
+    match r.read_u8().await? {
+        0 => Ok(Serialization::Dense),
+        1 => read_kind_tree(r, name, col_type, 0).await,
+        flag => Err(Error::BadResponse(format!(
+            "native: column '{name}' has custom-serialization flag {flag} \
+             -- the server writes a bool here"
+        ))),
+    }
+}
+
+/// Read the kind stack for `col_type` and, for a `Tuple`, each element's.
+fn read_kind_tree<'a, R: ClickHouseRead + 'a>(
+    r: &'a mut R,
+    name: &'a str,
+    col_type: &'a ColumnType,
+    depth: usize,
+) -> Pin<Box<dyn std::future::Future<Output = Result<Serialization>> + Send + 'a>> {
+    Box::pin(async move {
+        if depth > MAX_DECODE_DEPTH {
+            return Err(Error::BadResponse(format!(
+                "native: column type nesting exceeds {MAX_DECODE_DEPTH} levels"
+            )));
+        }
+        let sparse = read_kind_stack(r, name).await?;
+        let Some(fields) = tuple_fields(col_type) else {
+            return Ok(if sparse {
+                Serialization::Sparse
+            } else {
+                Serialization::Dense
+            });
+        };
+        // `DataTypeTuple::getSerialization` drops a Tuple's own Sparse kind,
+        // so its body is dense whatever that byte says.
+        let mut elements = with_cap(fields.len())?;
+        for field in fields {
+            elements.push(read_kind_tree(r, name, field, depth + 1).await?);
+        }
+        Ok(Serialization::Tuple(elements))
+    })
+}
+
+/// Read one kind-stack byte and report whether it is sparse.
 ///
-/// The kind byte's first four values predate kind stacks, so a stack of exactly
+/// The byte's first four values predate kind stacks, so a stack of exactly
 /// `{Default, Sparse}` reads as 1 on every server that has ever sent sparse.
 /// Everything past that is a serialisation we cannot decode, so it is named and
 /// refused rather than guessed at.
-async fn read_serialization_kind<R: ClickHouseRead>(r: &mut R, name: &str) -> Result<bool> {
-    match r.read_u8().await? {
-        0 => return Ok(false),
-        1 => {}
-        flag => {
-            return Err(Error::BadResponse(format!(
-                "native: column '{name}' has custom-serialization flag {flag} \
-                 -- the server writes a bool here"
-            )));
-        }
-    }
-
+async fn read_kind_stack<R: ClickHouseRead>(r: &mut R, name: &str) -> Result<bool> {
     // KindStackBinarySerializationType, from SerializationInfo.cpp.
     let kind = match r.read_u8().await? {
         0 => return Ok(false), // {Default} -- the flag was set, the stack is plain
@@ -861,48 +931,38 @@ pub(crate) async fn decode_block<R: ClickHouseRead>(
     for _ in 0..num_columns {
         let name = r.read_utf8_string().await?;
         let type_name = r.read_utf8_string().await?;
-        let sparse = if has_custom_ser {
-            read_serialization_kind(r, &name).await?
+        let Some(ct) = ColumnType::parse(&type_name) else {
+            // The stream pointer cannot advance past a type of unknown
+            // size, so the connection is poisoned rather than desynced.
+            return Err(Error::BadResponse(format!(
+                "native: server announced unknown column type '{type_name}' for column '{name}'"
+            )));
+        };
+        let serialization = if has_custom_ser {
+            read_serialization(r, &name, &ct).await?
         } else {
-            false
+            Serialization::Dense
         };
 
-        let col = match ColumnType::parse(&type_name) {
-            Some(ct) => {
-                // A header block declares its columns and carries no bytes
-                // for any of them, the serialisation prefix included.
-                let mut prefixes = Vec::new();
-                if num_rows > 0 {
-                    decode_prefixes(r, &ct, 0, &mut prefixes).await?;
-                }
-                let mut headers = prefixes.into_iter();
-                if sparse && num_rows > 0 {
-                    // Offsets first, then only the non-default values, so the
-                    // dense read is sized by the offset count rather than the
-                    // block's row count.
-                    let rows = usize::try_from(num_rows).unwrap_or(usize::MAX);
-                    let mut state = crate::native::sparse::SparseDeserializeState::default();
-                    let positions =
-                        crate::native::sparse::read_sparse_offsets(r, rows, &mut state).await?;
-                    let present = u64::try_from(positions.len()).unwrap_or(u64::MAX);
-                    let dense = decode_column(r, &ct, present, server_revision, 0, &mut headers)
-                        .await
-                        .map_err(|e| name_the_column(&name, e))?;
-                    dense.expand_sparse(&positions, rows, &mut sparse_budget)?
-                } else {
-                    decode_column(r, &ct, num_rows, server_revision, 0, &mut headers)
-                        .await
-                        .map_err(|e| name_the_column(&name, e))?
-                }
-            }
-            None => {
-                // The stream pointer cannot advance past a type of unknown
-                // size, so the connection is poisoned rather than desynced.
-                return Err(Error::BadResponse(format!(
-                    "native: server announced unknown column type '{type_name}' for column '{name}'"
-                )));
-            }
-        };
+        // A header block declares its columns and carries no bytes for any
+        // of them, the serialisation prefix included.
+        let mut prefixes = Vec::new();
+        if num_rows > 0 {
+            decode_prefixes(r, &ct, 0, &mut prefixes).await?;
+        }
+        let mut headers = prefixes.into_iter();
+        let col = decode_serialized(
+            r,
+            &ct,
+            &serialization,
+            num_rows,
+            server_revision,
+            0,
+            &mut headers,
+            &mut sparse_budget,
+        )
+        .await
+        .map_err(|e| name_the_column(&name, e))?;
 
         schema.push((name, type_name));
         columns.push(col);
@@ -913,6 +973,83 @@ pub(crate) async fn decode_block<R: ClickHouseRead>(
         schema,
         num_rows,
         kind: BlockKind::Data,
+    })
+}
+
+/// Decode one column's values under the serialisation its header announced.
+///
+/// A sparse column, or a sparse `Tuple` element, carries its offsets first and
+/// then only the non-default values, so the dense read is sized by the offset
+/// count rather than the row count.
+// Each argument is one piece of reader state `decode_column` already threads.
+#[allow(clippy::too_many_arguments)]
+fn decode_serialized<'a, R: ClickHouseRead + 'a>(
+    r: &'a mut R,
+    col_type: &'a ColumnType,
+    serialization: &'a Serialization,
+    num_rows: u64,
+    server_revision: u64,
+    depth: usize,
+    headers: &'a mut std::vec::IntoIter<columns::DynamicHeader>,
+    sparse_budget: &'a mut usize,
+) -> Pin<Box<dyn std::future::Future<Output = Result<DecodedColumn>> + Send + 'a>> {
+    Box::pin(async move {
+        if depth == 0 && num_rows == 0 {
+            return Ok(empty_column(col_type));
+        }
+        match serialization {
+            Serialization::Dense => {
+                decode_column(r, col_type, num_rows, server_revision, depth, headers).await
+            }
+            Serialization::Sparse => {
+                let rows = usize::try_from(num_rows).unwrap_or(usize::MAX);
+                let mut state = crate::native::sparse::SparseDeserializeState::default();
+                let positions =
+                    crate::native::sparse::read_sparse_offsets(r, rows, &mut state).await?;
+                let present = u64::try_from(positions.len()).unwrap_or(u64::MAX);
+                let dense = match unwrapped(col_type) {
+                    // `SerializationSparse` sends a Nullable's values with no
+                    // null map: every value on the wire is non-null.
+                    ColumnType::Nullable(inner) => DecodedColumn::Nullable {
+                        mask: vec![0; positions.len()],
+                        child: Box::new(
+                            decode_column(r, inner, present, server_revision, depth + 1, headers)
+                                .await?,
+                        ),
+                    },
+                    _ => {
+                        decode_column(r, col_type, present, server_revision, depth, headers).await?
+                    }
+                };
+                dense.expand_sparse(&positions, rows, sparse_budget)
+            }
+            Serialization::Tuple(kinds) => {
+                let fields = tuple_fields(col_type)
+                    .filter(|fields| fields.len() == kinds.len())
+                    .ok_or_else(|| {
+                        Error::BadResponse(
+                            "native: Tuple serialisation does not match its type".into(),
+                        )
+                    })?;
+                let mut decoded = with_cap(fields.len())?;
+                for (field, kind) in fields.iter().zip(kinds) {
+                    decoded.push(
+                        decode_serialized(
+                            r,
+                            field,
+                            kind,
+                            num_rows,
+                            server_revision,
+                            depth + 1,
+                            headers,
+                            sparse_budget,
+                        )
+                        .await?,
+                    );
+                }
+                Ok(DecodedColumn::Tuple(decoded))
+            }
+        }
     })
 }
 
@@ -2101,17 +2238,21 @@ mod tests {
     /// body under the wrong serialisation would desync the whole connection.
     #[tokio::test]
     async fn rejects_a_serialization_kind_it_cannot_decode() {
-        for (kind, want) in [
-            (2u8, "Detached"),
-            (3u8, "Detached over Sparse"),
-            (4u8, "Replicated"),
-            (6u8, "kind 6"),
+        for (type_name, kinds, want) in [
+            ("UInt8", &[2u8][..], "Detached"),
+            ("UInt8", &[3], "Detached over Sparse"),
+            ("UInt8", &[4], "Replicated"),
+            ("UInt8", &[6], "kind 6"),
+            // Every Tuple element carries its own stack, and each is checked.
+            ("Tuple(UInt8, UInt8)", &[0, 1, 4], "Replicated"),
+            ("Tuple(UInt8, Tuple(UInt8))", &[0, 0, 0, 2], "Detached"),
+            ("Point", &[0, 3], "Detached over Sparse"),
         ] {
             let mut bytes = Vec::new();
             bytes.write_string(b"x").await.unwrap();
-            bytes.write_string(b"UInt8").await.unwrap();
+            bytes.write_string(type_name.as_bytes()).await.unwrap();
             bytes.push(1u8);
-            bytes.push(kind);
+            bytes.extend_from_slice(kinds);
             let mut cur = Cursor::new(bytes);
             let err = decode_block(&mut cur, 1, 0, REV).await.unwrap_err();
             match err {
@@ -2140,31 +2281,123 @@ mod tests {
         }
     }
 
-    /// A sparse column carries only its non-default values, so the decoder has
-    /// to put them back where they came from and fill the rest with defaults.
+    /// A sparse column, or a sparse `Tuple` element, carries only its
+    /// non-default values, so the decoder has to put them back where they came
+    /// from, fill the rest with defaults, and end exactly on the body's last
+    /// byte. Shaped on what a 26.3 server sends: the kind bytes are the flag's
+    /// stack and then, for a `Tuple`, every element's.
     #[tokio::test]
     async fn sparse_column_expands_to_full_rows() {
         use crate::native::sparse::END_OF_GRANULE_FLAG;
+        use DecodedColumn::{Float64, Nullable, Tuple, UInt8};
 
-        let mut bytes = Vec::new();
-        bytes.write_string(b"v").await.unwrap();
-        bytes.write_string(b"UInt8").await.unwrap();
-        bytes.push(1u8); // has_custom_serialization
-        bytes.push(1u8); // KindStack {Default, Sparse}
         // Non-defaults at rows 1 and 3 of 5: one default before each, then one
         // trailing default carrying the end-of-granule flag.
         let mut offsets = Vec::new();
         offsets.put_var_uint(1);
         offsets.put_var_uint(1);
         offsets.put_var_uint(1 | END_OF_GRANULE_FLAG);
-        bytes.extend_from_slice(&offsets);
-        bytes.extend_from_slice(&[7u8, 9u8]);
+        let sparse_u8 = [&offsets[..], &[7, 9][..]].concat();
+        let dense_u8 = [1u8, 2, 3, 4, 5];
+        let scattered = || UInt8(vec![0, 7, 0, 9, 0]);
+        let f64s = |v: &[f64]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
 
-        let mut cur = Cursor::new(bytes);
-        let block = decode_block(&mut cur, 1, 5, REV).await.unwrap();
-        match block.column("v").unwrap() {
-            DecodedColumn::UInt8(values) => assert_eq!(values, &[0, 7, 0, 9, 0]),
-            other => panic!("expected UInt8, got {other:?}"),
+        let cases: Vec<(&str, &[u8], Vec<u8>, DecodedColumn)> = vec![
+            ("UInt8", &[1], sparse_u8.clone(), scattered()),
+            (
+                "Tuple(UInt8, String)",
+                &[0, 1, 1],
+                [&sparse_u8[..], &offsets[..], &[1, b'a', 1, b'b'][..]].concat(),
+                Tuple(vec![
+                    scattered(),
+                    DecodedColumn::String(vec![
+                        vec![],
+                        b"a".to_vec(),
+                        vec![],
+                        b"b".to_vec(),
+                        vec![],
+                    ]),
+                ]),
+            ),
+            (
+                "Tuple(UInt8, Tuple(UInt8, UInt8))",
+                &[0, 0, 0, 1, 0],
+                [&dense_u8[..], &sparse_u8[..], &dense_u8[..]].concat(),
+                Tuple(vec![
+                    UInt8(dense_u8.to_vec()),
+                    Tuple(vec![scattered(), UInt8(dense_u8.to_vec())]),
+                ]),
+            ),
+            // A Nullable's sparse values carry no null map, and every skipped
+            // row is NULL.
+            (
+                "Tuple(Nullable(UInt8), UInt8)",
+                &[0, 1, 0],
+                [&sparse_u8[..], &dense_u8[..]].concat(),
+                Tuple(vec![
+                    Nullable {
+                        mask: vec![1, 0, 1, 0, 1],
+                        child: Box::new(scattered()),
+                    },
+                    UInt8(dense_u8.to_vec()),
+                ]),
+            ),
+            (
+                "Point",
+                &[0, 1, 0],
+                [&offsets[..], &f64s(&[1.5, 2.5])[..], &f64s(&[1.0; 5])[..]].concat(),
+                Tuple(vec![
+                    Float64(vec![0.0, 1.5, 0.0, 2.5, 0.0]),
+                    Float64(vec![1.0; 5]),
+                ]),
+            ),
+            (
+                "SimpleAggregateFunction(any, Tuple(Nullable(UInt8), UInt8))",
+                &[0, 1, 0],
+                [&sparse_u8[..], &dense_u8[..]].concat(),
+                Tuple(vec![
+                    Nullable {
+                        mask: vec![1, 0, 1, 0, 1],
+                        child: Box::new(scattered()),
+                    },
+                    UInt8(dense_u8.to_vec()),
+                ]),
+            ),
+            (
+                "Tuple(SimpleAggregateFunction(any, Nullable(UInt8)))",
+                &[0, 1],
+                sparse_u8.clone(),
+                Tuple(vec![Nullable {
+                    mask: vec![1, 0, 1, 0, 1],
+                    child: Box::new(scattered()),
+                }]),
+            ),
+            // A Tuple's own Sparse kind is dropped by the server: the body is dense.
+            (
+                "Tuple(UInt8, UInt8)",
+                &[1, 0, 0],
+                [dense_u8, dense_u8].concat(),
+                Tuple(vec![UInt8(dense_u8.to_vec()), UInt8(dense_u8.to_vec())]),
+            ),
+        ];
+
+        for (type_name, kinds, body, want) in cases {
+            let mut bytes = Vec::new();
+            bytes.write_string(b"v").await.unwrap();
+            bytes.write_string(type_name.as_bytes()).await.unwrap();
+            bytes.push(1u8); // has_custom_serialization
+            bytes.extend_from_slice(kinds);
+            bytes.extend_from_slice(&body);
+            let end = bytes.len() as u64;
+
+            let mut cur = Cursor::new(bytes);
+            let block = decode_block(&mut cur, 1, 5, REV).await.unwrap();
+            assert_eq!(
+                format!("{:?}", block.column("v").unwrap()),
+                format!("{want:?}"),
+                "{type_name}"
+            );
+            assert_eq!(cur.position(), end, "{type_name} did not end on its body");
         }
     }
 
