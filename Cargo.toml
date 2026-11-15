@@ -10,7 +10,7 @@
 name = "dfe-clickhouse"
 version = "0.1.0"
 edition = "2024"
-# Upstream's MSRV. Keep in step with rust-toolchain.toml.
+# Upstream's MSRV, kept equal to its `rust-version`.
 rust-version = "1.89.0"
 description = "HyperI extensions for the official ClickHouse Rust client: TCP transport, dynamic inserts, unified client"
 authors = ["HYPERI PTY LIMITED <dev@hyperi.io>"]
@@ -22,10 +22,9 @@ readme = "docs/crate.md"
 publish = true
 keywords = ["clickhouse", "database", "tcp", "tokio"]
 categories = ["database", "asynchronous"]
-# `docs/` ships: it is 24K, the type-support and insert-format pages are
-# consumer-facing, and `src/native/mod.rs` and `src/tcp/pool.rs` point at
-# `docs/coverage.md` -- excluding it left those references dangling in the
-# published tarball. `.github/` and `.githooks/` are repo machinery and stay out.
+# `docs/` ships: the type-support and insert-format pages are consumer-facing,
+# and `src/native/mod.rs` and `src/tcp/pool.rs` point at `docs/coverage.md`.
+# `.github/` and `.githooks/` are repo machinery and stay out.
 exclude = [".github/", ".githooks/"]
 
 [package.metadata.docs.rs]
@@ -112,7 +111,7 @@ proptest = { version = ">=1.12.0, <2", default-features = false, features = ["st
 name = "insert_bench"
 required-features = ["full"]
 
-# Upstream's lint set plus `unsafe_code = "deny"`.
+# Upstream's `rust_2018_idioms` and `unreachable_pub`, plus `unsafe_code` and `missing_docs`.
 [lints.rust]
 rust_2018_idioms = { level = "warn", priority = -1 }
 unreachable_pub = "warn"

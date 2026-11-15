@@ -5,11 +5,7 @@ terms outlined below.
 
 ## Stay close to upstream
 
-This crate extends the official ClickHouse Rust client and expects code to
-travel back and forth with it. Keep files upstream-shaped: same edition, same
-MSRV (`rust-toolchain.toml`), same `rustfmt.toml`, same lint set. A file that
-needs a reformat before it can be cherry-picked has already cost more than it
-saved.
+This crate extends the official ClickHouse Rust client and expects code to travel back and forth with it. Keep files close to upstream: same edition, same MSRV (`rust-version` in `Cargo.toml`), same `rustfmt.toml`, and upstream's lints plus this crate's stricter ones. A file that needs a reformat before it can be cherry-picked has already cost more than it saved.
 
 The dependency on `clickhouse` is a published crates.io release, and only ever
 that. No `git =`, no `path =`, no `[patch.crates-io]`.
@@ -42,7 +38,7 @@ versioning and changelog generation. All commits must follow this format:
 | `build` | Changes to build system or dependencies | None |
 | `ci` | Changes to CI configuration | None |
 | `chore` | Other changes that don't modify src or test files | None |
-| `revert` | Reverts a previous commit | Varies |
+| `revert` | Reverts a previous commit | Patch (0.0.X) |
 
 ### Breaking Changes
 
@@ -57,16 +53,15 @@ BREAKING CHANGE: The /v1/users endpoint has been removed. Use /v2/users instead.
 
 ### Scope
 
-Scope is optional but recommended. Use the layer the change lands in: `tcp`,
-`tls`, `native`, `dynamic`, `unified`, `ext`, `inserter`.
+Scope is optional but recommended. Use the layer the change lands in: `tcp`, `tls`, `native`, `dynamic`, `unified`, `ext`.
 
 ## Semantic Versioning
 
 This project follows [Semantic Versioning 2.0.0](https://semver.org/):
 
-- **MAJOR** (X.0.0): Breaking changes that require users to modify their code
-- **MINOR** (0.X.0): New features that are backwards-compatible
-- **PATCH** (0.0.X): Bug fixes and minor improvements
+- MAJOR (X.0.0): breaking changes that require users to modify their code
+- MINOR (0.X.0): new features that are backwards-compatible
+- PATCH (0.0.X): bug fixes and minor improvements
 
 Versions are automatically determined by semantic-release based on commit
 messages. Do not manually update version numbers.
@@ -76,8 +71,7 @@ breaking change.
 
 ## Developer Certificate of Origin
 
-This project uses the Developer Certificate of Origin (DCO) to ensure that
-contributors have the right to submit their contributions.
+This project uses the Developer Certificate of Origin (DCO), so each contributor certifies they have the right to submit their contribution.
 
 By making a contribution to this project, you certify that:
 
@@ -116,9 +110,7 @@ git config --global user.email "your.email@example.com"
 
 ## Feature layers
 
-Every layer of this crate is behind a Cargo feature, so a change that only
-compiles with the default set is a broken change. Check both ends of the
-matrix before you push:
+Every layer of this crate but the Native codec is behind a Cargo feature, so a change that only compiles with the default set is a broken change. Check both ends of the matrix before you push:
 
 ```bash
 make check-features
@@ -134,20 +126,15 @@ green instead of bouncing:
 hyperi-ci check
 ```
 
-`hyperi-ci` is the HyperI CI CLI (public on PyPI). If you do not have it, install
-it once with `uv tool install hyperi-ci` (or `pipx install hyperi-ci`), or run it
-ad hoc with `uvx hyperi-ci check`. It runs the project's full local validation --
-the same suite CI runs -- and reports what to fix. Run it before every push and
-before opening a pull request; it is the single best way to give your change the
-best chance of surviving CI.
+`hyperi-ci` is the HyperI CI CLI (public on PyPI). If you do not have it, install it once with `uv tool install hyperi-ci` (or `pipx install hyperi-ci`), or run it ad hoc with `uvx hyperi-ci check`. It runs the project's full local validation -- the same suite CI runs -- and reports what to fix. Run it before every push and before opening a pull request.
 
 ## How to Contribute
 
-1. **Fork the repository** and create your branch from `main`
-2. **Make your changes** following the commit message format above
-3. **Sign off your commits** with the DCO
-4. **Test your changes** to ensure they work as expected
-5. **Submit a pull request** with a clear description of what you've done
+1. Fork the repository and create your branch from `main`
+2. Make your changes, following the commit message format above
+3. Sign off your commits with the DCO
+4. Run the tests and `make check-features`
+5. Open a pull request that says what changed and why
 
 ### Pull Request Checklist
 
@@ -159,15 +146,13 @@ best chance of surviving CI.
 
 ## CI/CD Workflow
 
-When your pull request is merged to `main`:
+A merge to `main` releases only when its commit carries a `Release: true` trailer, or when a maintainer dispatches the CI workflow to release. Then:
 
-1. **semantic-release** analyses commit messages since the last release
+1. semantic-release analyses commit messages since the last release
 2. Determines the next version number based on commit types
 3. Generates/updates the CHANGELOG
 4. Creates a new GitHub release with release notes
 5. Publishes the crate to crates.io
-
-This happens automatically - no manual intervention required.
 
 ## Questions
 

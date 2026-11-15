@@ -13,8 +13,8 @@
 //! failure here is this crate's decoder rather than its encoder; the encoder
 //! is covered separately, and by one test that uses the server as its oracle.
 //!
-//! None of these is `#[ignore]`d. `hyperi-ci` runs `cargo nextest` with no way
-//! to pass `--run-ignored`, so an ignored test here is one CI never runs.
+//! None of these is `#[ignore]`d. CI runs `hyperi-ci`'s core test tier, which
+//! skips ignored tests, so an ignored test here is one CI never runs.
 //! Without a container runtime they fail under `$CI` and skip with a message
 //! anywhere else.
 //!
@@ -1684,10 +1684,8 @@ async fn typed_path_json_round_trips_in_string_mode() {
 /// stored with sparse serialisation. Real tables look like this.
 ///
 /// Passing does not prove the sparse form reached the wire: the server may
-/// have materialised the column before sending. This decoder rejects a
-/// non-zero custom-serialization flag outright, so it would have failed loudly
-/// if it had not. Proving the wire form needs that flag observed rather than
-/// the values alone.
+/// have materialised the column before sending. Proving the wire form needs
+/// the custom-serialization flag observed rather than the values alone.
 #[tokio::test]
 async fn a_sparse_column_reads_back_on_both_transports() {
     const TOTAL: &str = "SELECT sum(c) AS total FROM wire.sparse";
