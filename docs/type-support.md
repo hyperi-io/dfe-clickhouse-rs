@@ -96,7 +96,8 @@ Where it would print something the server would not, the read fails with
 Wired and proved live. A column whose defaults pass
 `ratio_of_defaults_for_sparse_serialization` arrives as an offset list plus
 only the non-default values, and the decoder scatters it back to the block's
-full length. Scalars only, which is all the server sparse-serialises; a
+full length. The server sparse-serialises scalars, `Nullable` (whose sparse
+values carry no null map), and each element of a `Tuple` on its own. Any other
 composite arriving that way is refused by name.
 
 The header that selects it is TWO bytes, not one, and the second is easy to
@@ -105,8 +106,14 @@ when it is set, a byte naming the kind stack (0 Default, 1 Sparse, 2 Detached,
 3 Detached-over-Sparse, 4 Replicated, 5 a combination with its own varuint
 count). Reading the flag alone and treating 1 as "sparse" leaves the kind byte
 on the wire; one byte of drift then corrupts every following column and
-surfaces as an unknown packet id nowhere near the cause. Only Default and
-Sparse are decoded; the rest are refused by name.
+surfaces as an unknown packet id nowhere near the cause. A `Tuple` (and
+`Point`) writes its own kind byte and then every element's, recursively, so
+`Tuple(UInt64, String)` with both elements sparse is `01 00 01 01`. Only
+Default and Sparse are decoded, and the rest are refused by name.
+
+A TCP read has a default timeout on the gap between packets
+(`TcpClient::with_read_timeout`), so a stalled decode returns an error rather
+than hanging the caller.
 
 ## Not implemented
 

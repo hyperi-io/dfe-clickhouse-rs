@@ -236,7 +236,7 @@ impl TcpClient {
     /// Per-operation I/O deadline threaded into every spawned actor: the gap
     /// between packets on a read, and the whole of an INSERT block or finish
     /// write. A timeout poisons the connection and returns
-    /// [`crate::Error::TimedOut`].
+    /// [`crate::Error::TimedOut`]. Defaults to 300s, and `None` turns it off.
     #[must_use]
     pub fn with_read_timeout(mut self, d: Option<Duration>) -> Self {
         self.config.pool.read_timeout = d;

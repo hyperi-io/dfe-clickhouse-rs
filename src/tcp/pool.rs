@@ -65,6 +65,11 @@ pub(crate) const DEFAULT_CREATE_TIMEOUT: Duration = Duration::from_secs(10);
 /// shutdown, so this bounds a writer close against an unresponsive peer.
 pub(crate) const DEFAULT_RECYCLE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Default I/O deadline, matching the server's own `send_timeout` and
+/// clickhouse-go's `ReadTimeout`, so a stalled read returns
+/// [`Error::TimedOut`] instead of hanging the caller.
+pub(crate) const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// deadpool `Manager` implementation for ClickHouse TCP connections.
 ///
 /// `create` opens a fresh socket via
@@ -394,8 +399,8 @@ pub struct PoolConfig {
     /// The read timer resets on each packet, so it bounds the gap BETWEEN
     /// packets, not total query time -- a long streaming SELECT that keeps
     /// delivering blocks never trips it. A block write is bounded as a
-    /// whole, so size the timeout for the largest block. `None` (default)
-    /// leaves I/O bounded only by caller-side cancellation.
+    /// whole, so size the timeout for the largest block. Defaults to 300s,
+    /// and `None` leaves I/O bounded only by caller-side cancellation.
     pub read_timeout: Option<Duration>,
 }
 
@@ -407,7 +412,7 @@ impl Default for PoolConfig {
             create_timeout: Some(DEFAULT_CREATE_TIMEOUT),
             recycle_timeout: Some(DEFAULT_RECYCLE_TIMEOUT),
             max_lifetime: None,
-            read_timeout: None,
+            read_timeout: Some(DEFAULT_READ_TIMEOUT),
         }
     }
 }
