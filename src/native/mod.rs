@@ -3,12 +3,10 @@
 //!
 //! HOT PATH. Every row in and out of the server passes through here, so this
 //! module is held to a 90% line-coverage target rather than the repo's 80%
-//! floor, and every file in it meets that today. `docs/coverage.md` carries
-//! the numbers and how to measure them. Adding a wire format here means adding
-//! the test with it, or the next reader inherits a claim that is no longer
-//! true.
+//! floor. `docs/coverage.md` says how to measure it. Adding a wire format here
+//! means adding the test with it.
 //!
-//! Upstream's `src/rowbinary/` is row-oriented; this module is the columnar
+//! Upstream's `src/rowbinary/` is row-oriented. This module is the columnar
 //! primitive that lets the server write blocks into its merge tree without a
 //! rows-to-columns transpose.
 //!
@@ -24,10 +22,10 @@
 //!   [`tokio::io::AsyncRead`]/[`tokio::io::AsyncWrite`] and [`bytes::BufMut`].
 //!
 //! The TCP transport in `src/tcp/` is a separate wire protocol that happens to
-//! carry Native-format data blocks; HTTP carries the same blocks under
+//! carry Native-format data blocks, and HTTP carries the same blocks under
 //! `format=Native`.
 
-// The reader and decoder exist for the TCP transport; a build without it
+// The reader and decoder exist for the TCP transport, so a build without it
 // carries the codec with no in-tree caller. Scoped to that build so dead code
 // still warns in the default one.
 #![cfg_attr(not(feature = "tcp"), allow(dead_code))]

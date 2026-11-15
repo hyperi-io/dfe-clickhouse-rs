@@ -1,7 +1,7 @@
 //! deadpool-managed connection pool for the TCP transport.
 //!
 //! HOT PATH. Every operation acquires from here, so this module is held to a
-//! 90% line-coverage target rather than the repo's 80% floor, and meets it.
+//! 90% line-coverage target rather than the repo's 80% floor.
 //! See `docs/coverage.md`.
 //!
 //! Wraps [`crate::tcp::connection_actor::ConnectionHandle`] in a

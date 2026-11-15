@@ -26,16 +26,8 @@ build:
   strategies:
   - native
   rust:
-    # Every layer is a feature; the default build covers little of the crate.
-    #
-    # KNOWN GAP: `-D warnings` therefore reaches only this set. The
-    # feature_matrix check runs `cargo hack --each-feature --no-dev-deps
-    # check`, and `check` does not fail on a warning, so feature-gated dead
-    # code and feature-conditional lints pass CI. Four of them accumulated in
-    # the DEFAULT set (tcp + lz4) -- the one `cargo add dfe-clickhouse`
-    # compiles -- before the review gate started linting it on 2026-09-02.
-    # Until hyperi-ci can lint more than one set, the review gate covers
-    # default, no-default, and dynamic-only.
+    # Every layer but the codec is a feature. `-D warnings` reaches only this
+    # set, and the feature matrix reports the others' warnings without failing.
     features: all
     targets: []
 release:
