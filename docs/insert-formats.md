@@ -22,14 +22,13 @@ ClickHouse's own [format benchmark](https://clickhouse.com/blog/clickhouse-input
 
 There is no JSONEachRow path. `DynamicInsert` takes the same `Map<String, Value>` rows a JSON encoder would, and encodes them to RowBinary or transposes them into Native columnar blocks. The caller's code looks the same either way, and the server parses no row text, only the documents bound for `JSON` columns.
 
-Over native TCP the choice does not exist at all: the protocol accepts Native
-format and nothing else, which is a server constraint rather than a gap here.
+Over native TCP the choice does not exist: the protocol accepts Native format and nothing else, a server constraint rather than a gap here.
 
 Both formats check the cached schema against the table. The HTTP header declares each column's type, and the server refuses a type the table no longer has with code 117 (`INCORRECT_DATA`). The insert sets `input_format_with_types_use_header=1` itself, so a client default or user profile cannot turn that check off. Over TCP the server answers the INSERT with its own types, and the insert refuses a difference before sending a row. Without either check a stale schema's bytes are read as the new type: "abc" sent as a String lands in a UInt32 column as 1667391747, and 300 sent as a UInt64 lands in a UInt8 column as 44. Both refusals are `DynamicError::SchemaMismatch`, which drops the cached schema.
 
 Neither format has a per-row default. An INSERT names the required columns and the defaulted ones its rows supply, and the server fills the rest from their DEFAULT expressions. Rows that supply a different set go to another INSERT. Over HTTP up to four of those stay open at once, so a batch whose rows carry four sets or fewer is one INSERT per set, and a fifth set commits the oldest first. Over TCP a row that supplies a different set commits the rows so far and opens a new INSERT. A batch whose rows vary that way becomes several INSERTs, and an error late in it can follow rows already committed. Retry the whole batch. Where the client sets `insert_deduplication_token`, each INSERT gets that token plus the defaulted columns its rows supply, so the INSERTs do not suppress each other and a retry of the same rows in the same order lands once. A row that supplies no column at all, on a table whose every column has a default, goes over HTTP as `RowBinaryWithDefaults` with every column flagged, so no value crosses the wire.
 
-Both transports send once 1 MiB of rows is buffered, so a batch never sits whole in memory.
+Both transports send once 1 MiB of rows is buffered, and TCP also at `TcpClient::DEFAULT_INSERT_BLOCK_ROWS` (1,000,000) rows, so a batch never sits whole in memory.
 
 ## What the encoder does that JSONEachRow does not
 
@@ -39,7 +38,7 @@ The server parses JSONEachRow against the table's types, so it maps a string to 
 
 Measured 2026-11-01 against ClickHouse 26.3.21.7. The same rows go through `UnifiedClient::dynamic_insert` three ways: HTTP RowBinary with LZ4, HTTP RowBinary uncompressed, and native TCP. Native TCP has no compressed option, because this crate negotiates no block codec on the native protocol.
 
-At 100k rows native finished in about half the time and used 16-36% less server CPU. It cost 7-32% more client CPU, because the client builds the columns. At 10k rows the server CPU gap sits inside the noise. Uncompressed, both send about 32 MB per 100k rows, and HTTP with LZ4 sends 6.4 MB.
+At 100k rows native finished in about half the time and used 16-36% less server CPU. It cost 7-32% more client CPU, because the client builds the columns. At 10k rows the server CPU gap sat inside the noise. Uncompressed, both sent about 32 MB per 100k rows, and HTTP with LZ4 sent 6.4 MB.
 
 The setup:
 

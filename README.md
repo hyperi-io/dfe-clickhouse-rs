@@ -50,12 +50,12 @@ cargo add dfe-clickhouse --features tcp
 Reads are column-typed, and `JSON`, `Variant` and `Dynamic` decode to their
 per-row document text.
 
-Why native, from a 100k-row runtime-schema insert against ClickHouse 26.3 on 2026-11-01 ([insert-formats](https://github.com/hyperi-io/dfe-clickhouse-rs/blob/main/docs/insert-formats.md#native-against-http-rowbinary)):
+Why native, measured on 2026-11-01 with a 100k-row runtime-schema insert against ClickHouse 26.3 ([insert-formats](https://github.com/hyperi-io/dfe-clickhouse-rs/blob/main/docs/insert-formats.md#native-against-http-rowbinary)):
 
 - About half the elapsed time: 799 and 920 ms against 1,548-2,281 ms over HTTP RowBinary.
 - 16-36% less server CPU: 772 and 889 ms against 997-1,206 ms.
 - 7-32% more client CPU, because the client builds the columns: 659 and 692 ms against 523-617 ms.
-- No compression: the protocol supports LZ4 blocks, but this client sends them uncompressed, 32 MB on the wire where HTTP with LZ4 sends 6.4 MB.
+- No compression: the protocol supports LZ4 blocks, but this client sends them uncompressed, 32 MB on the wire in that run where HTTP with LZ4 sent 6.4 MB.
 
 ```rust,ignore
 use dfe_clickhouse::TcpClient;

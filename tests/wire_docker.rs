@@ -1701,7 +1701,8 @@ async fn a_sparse_column_reads_back_on_both_transports() {
         .execute("CREATE DATABASE IF NOT EXISTS wire")
         .await
         .unwrap();
-    // The default ratio is 0.95; 1 non-default row in 10,000 is well under it.
+    // The server default ratio is 0.9375 and the table sets 0.9. One non-default
+    // row in 10,000 passes either.
     client
         .execute(
             "CREATE OR REPLACE TABLE wire.sparse (n UInt64, c UInt64) \
@@ -2007,6 +2008,10 @@ const DFE_TYPES: &[DfeType] = &[
         &[(r#"[{"k":"v"}]"#, "[{'k':'v'}]")],
     ),
     reads("Array(JSON)", &[(r#"[{"a":1}]"#, r#"['{"a":1}']"#)]),
+    reads(
+        "Map(String, JSON)",
+        &[(r#"{"k":{"a":1}}"#, r#"{'k':'{"a":1}'}"#)],
+    ),
     reads(
         "JSON(`a.b` UInt32)",
         &[(r#"{"a":{"b":1},"c":"x"}"#, r#"{"a":{"b":1},"c":"x"}"#)],
