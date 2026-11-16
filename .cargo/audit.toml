@@ -6,8 +6,7 @@
 # License:   Apache-2.0
 # Copyright: (c) 2026 HYPERI PTY LIMITED
 
-# Ignored advisories -- transitive deps we cannot fix. Review on every
-# dependency update, and delete an entry the moment upstream ships a fix.
+# Transitive advisories with no fix. Delete an entry once upstream ships one.
 
 [advisories]
 ignore = []

@@ -7,7 +7,9 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/hyperi-io/dfe-clickhouse-rs/blob/main/LICENSE)
 <!-- BADGES:END -->
 
-Extensions for the official [`clickhouse`](https://crates.io/crates/clickhouse) Rust client, built for loading data in volume. It depends on the published `clickhouse` release and changes nothing in it, so the HTTP client you already use keeps working as it is.
+HyperI extensions for the official ClickHouse Rust client: TCP transport, dynamic inserts, unified client.
+
+Not a fork. It depends on the published [`clickhouse`](https://crates.io/crates/clickhouse) release, with no `git`, `path` or `[patch]`, and changes nothing in it, so the HTTP client you use keeps working as it is. Same edition, MSRV and rustfmt settings, and upstream's lints plus stricter ones, so [ClickHouse/clickhouse-rs](https://github.com/ClickHouse/clickhouse-rs) can cherry-pick from here without a reformat.
 
 ## What it gives you
 
@@ -25,7 +27,7 @@ cargo add clickhouse dfe-clickhouse
 ## Extension traits on the HTTP client
 
 `ping`, `kill_query`, `with_query_id`, `with_session_id`, `with_role`, and
-`ServerException::parse` for a typed error carrying the server's own code.
+`ServerException::parse` for a typed error with the server's error code.
 
 ```rust,no_run
 use clickhouse::Client;
@@ -50,12 +52,12 @@ cargo add dfe-clickhouse --features tcp
 Reads are column-typed, and `JSON`, `Variant` and `Dynamic` decode to their
 per-row document text.
 
-Why native, measured on 2026-11-01 with a 100k-row runtime-schema insert against ClickHouse 26.3 ([insert-formats](https://github.com/hyperi-io/dfe-clickhouse-rs/blob/main/docs/insert-formats.md#native-against-http-rowbinary)):
+Why native, from a run on 2026-11-01 of a 100k-row runtime-schema insert against ClickHouse 26.3 ([insert-formats](https://github.com/hyperi-io/dfe-clickhouse-rs/blob/main/docs/insert-formats.md#native-against-http-rowbinary)):
 
 - About half the elapsed time: 799 and 920 ms against 1,548-2,281 ms over HTTP RowBinary.
 - 16-36% less server CPU: 772 and 889 ms against 997-1,206 ms.
 - 7-32% more client CPU, because the client builds the columns: 659 and 692 ms against 523-617 ms.
-- No compression: the protocol supports LZ4 blocks, but this client sends them uncompressed, 32 MB on the wire in that run where HTTP with LZ4 sent 6.4 MB.
+- No compression: the protocol supports LZ4 blocks, but this client sends them uncompressed, 32 MB on the wire in that run where HTTP with LZ4 sent 6.4 MB. LZ4 on the native protocol is [#33](https://github.com/hyperi-io/dfe-clickhouse-rs/issues/33).
 
 ```rust,ignore
 use dfe_clickhouse::TcpClient;
@@ -79,7 +81,7 @@ for block in &blocks {
 cargo add dfe-clickhouse --features dynamic
 ```
 
-Rows arrive as `serde_json::Map`, column types come from `system.columns`. Binary on the wire either way -- `FORMAT RowBinaryWithNamesAndTypes` over HTTP, `FORMAT Native` over TCP -- so the server parses no row text, only the documents bound for `JSON` columns.
+Rows arrive as `serde_json::Map`, column types come from `system.columns`. Binary on the wire either way -- `FORMAT RowBinaryWithNamesAndTypes` over HTTP, `FORMAT Native` over TCP -- so the server parses no row text beyond the documents bound for `JSON` columns.
 
 ## Features
 
@@ -101,80 +103,19 @@ upstream's. `tcp` brings deadpool, socket2 and backon.
 
 | Read | When |
 |---|---|
+| [architecture](https://github.com/hyperi-io/dfe-clickhouse-rs/blob/main/docs/architecture.md) | Asking why the crate is built the way it is |
 | [type-support](https://github.com/hyperi-io/dfe-clickhouse-rs/blob/main/docs/type-support.md) | Checking whether a column type reads and writes |
 | [insert-formats](https://github.com/hyperi-io/dfe-clickhouse-rs/blob/main/docs/insert-formats.md) | Asking why there is no JSONEachRow option |
 | [unified-client](https://github.com/hyperi-io/dfe-clickhouse-rs/blob/main/docs/unified-client.md) | Choosing a transport at runtime |
 | [coverage](https://github.com/hyperi-io/dfe-clickhouse-rs/blob/main/docs/coverage.md) | Adding to a hot-path module |
+| [CONTRIBUTING](https://github.com/hyperi-io/dfe-clickhouse-rs/blob/main/CONTRIBUTING.md#context) | Changing the crate: where things live, the commands that prove a change, and what tends to bite |
 
-## Upstream
+## Issues
 
-Not a fork. The dependency on the published `clickhouse` release is the only link -- no `git`, no `path`, no `[patch]`. Same edition, MSRV and rustfmt settings, and upstream's lints plus stricter ones, so [ClickHouse/clickhouse-rs](https://github.com/ClickHouse/clickhouse-rs) can cherry-pick from here without a reformat or a relicence.
+Open bugs: [this repo](https://github.com/hyperi-io/dfe-clickhouse-rs/issues?q=is%3Aopen+is%3Aissue+type%3ABug+-label%3Abacklog+-label%3Anext-minor) | [whole DFE suite](https://github.com/search?type=issues&q=is%3Aopen+is%3Aissue+type%3ABug+-label%3Abacklog+-label%3Anext-minor+repo%3Ahyperi-io%2Fdfe-infra+repo%3Ahyperi-io%2Fdfe-docker+repo%3Ahyperi-io%2Fdfe-deploy+repo%3Ahyperi-io%2Fdfe-engine+repo%3Ahyperi-io%2Fdfe-loader+repo%3Ahyperi-io%2Fdfe-receiver+repo%3Ahyperi-io%2Fdfe-fetcher+repo%3Ahyperi-io%2Fdfe-archiver+repo%3Ahyperi-io%2Fdfe-transform-vrl+repo%3Ahyperi-io%2Fdfe-transform-vector+repo%3Ahyperi-io%2Fdfe-transform-elastic+repo%3Ahyperi-io%2Fdfe-ui+repo%3Ahyperi-io%2Fdfe-hyperdx+repo%3Ahyperi-io%2Fscalo-rs+repo%3Ahyperi-io%2Fscalo-py+repo%3Ahyperi-io%2Flogreducer+repo%3Ahyperi-io%2Fdfe-schemas+repo%3Ahyperi-io%2Fvector-vrl+repo%3Ahyperi-io%2Fculvert+repo%3Ahyperi-io%2Fdfe-clickhouse-rs+repo%3Ahyperi-io%2Ffactbook-rs)
 
 ## Licence
 
 Apache-2.0. See
 [LICENSE](https://github.com/hyperi-io/dfe-clickhouse-rs/blob/main/LICENSE) and
 [NOTICE](https://github.com/hyperi-io/dfe-clickhouse-rs/blob/main/NOTICE).
-
-## Context
-
-Depth: [docs/architecture.md](https://github.com/hyperi-io/dfe-clickhouse-rs/blob/main/docs/architecture.md).
-
-### What this is
-
-Extensions to the official ClickHouse Rust client, in a separate crate that depends on the published `clickhouse` release. It adds a native TCP transport, runtime-schema inserts, and one client dispatching over either. Not a fork, not a rewrite, not a chart, not a schema tool: the only SQL it writes itself is its INSERTs, the `system.columns` read, `SELECT 1` and `KILL QUERY`, so it creates no database, table, view, role or Kafka topic.
-
-### Where things live
-
-| Path | Holds |
-|---|---|
-| `src/lib.rs` | crate root, the feature-gated module layers, and the README as the crate docs |
-| `src/ext.rs` | extension traits on `clickhouse::Client`, plus the typed server-exception parser |
-| `src/native/` | the Native wire codec -- HOT PATH, every row in or out passes through it |
-| `src/tcp/` | the TCP transport: connect, handshake, connection actor, pool, retry, protocol, reader, writer |
-| `src/dynamic/` | runtime-schema inserts -- the `system.columns` schema cache, encode, insert |
-| `src/unified.rs` | `UnifiedClient`, the dispatch enum over both transports |
-| `src/tls.rs`, `src/worker.rs` | rustls trust for TCP, and the internal primitive the connection actor uses |
-| `tests/wire_docker.rs` | the type matrix against a pinned ClickHouse in Docker |
-| `tests/*_live.rs` | ignored by default -- they need a real cluster |
-| `docs/` | the architecture, coverage, insert formats, type support, the unified client, and `crate.md`, the crates.io page |
-
-### Commands that prove a change
-
-```bash
-hyperi-ci check        # the full local gate, the same suite CI runs
-make check-features    # cargo check --all-features, then --no-default-features
-```
-
-Three ways green lies, each recorded in the repo:
-
-| It looks like | It is actually | Where |
-|---|---|---|
-| `-D warnings` covers the crate | It reaches only the `features: all` set. The feature matrix lints each feature set under clippy and names its warnings without failing, because `quality.rust.feature_matrix.warnings` defaults to `warn`, so feature-gated dead code and feature-conditional lints pass | `.hyperi-ci.yaml` |
-| The live tests ran | CI never runs the `#[ignore]`d tests in `tests/*_live.rs`. They need a real cluster through `CLICKHOUSE_DFE_ENV_FILE`, and CI runs hyperi-ci's `core` test tier, which skips ignored tests | `tests/*_live.rs` |
-| Coverage is held | CI does not measure it. `coverage: false` is deliberate -- hyperi-ci reads `test.min_coverage` for Python only. Measure out of band with `cargo llvm-cov --all-features --all-targets --summary-only`, keeping `--all-targets`, because a `--lib`-only run reads lower on the codec and invents regressions | `docs/coverage.md` |
-
-### What tends to bite
-
-| Don't | Do | Why |
-|---|---|---|
-| Trust a unit test on a wire format | Add a row to `tests/wire_docker.rs` | The sparse kind-stack bug sat in code the unit tests executed happily -- the fixtures agreed with the decoder because both were written from the same wrong reading of the spec. A real server writing the bytes caught it (`0ee6201`, `docs/coverage.md`) |
-| Raise the advertised protocol revision on its own | Consume the fields the new gates add, in the handshake and in Progress and ProfileInfo | `88137d3` advertised 54473 and stalled against a real server until `64baef4` and `aae05d3` read the added fields |
-| Add `#[ignore]` to a test in `tests/wire_docker.rs` | Leave it running and let it skip when there is no container runtime | CI runs the `core` test tier, which skips ignored tests, so an ignored test in that file is one CI never runs (`tests/wire_docker.rs:16`) |
-| Assume the default feature set is linted | Run `make check-features`, and lint the sets by hand | A lint ratchet macro hid 64 warnings until `66b271f` retired it, and `d49c721` then had to lint the sets nobody was linting |
-| Start a container per test and leave it to the runner | Keep the suite in the `docker-server` nextest group | The wire suite leaked a ClickHouse container per run until `db68d25`. nextest gives each test its own process, so an in-binary semaphore cannot serialise them, and a 2 GiB server for every test at once does not fit a build host (`.config/nextest.toml`) |
-| Reach for `git =`, `path =` or `[patch.crates-io]` on `clickhouse` | Depend on the published version | The crates.io release is the only link, which is what lets files travel back to `ClickHouse/clickhouse-rs` without a reformat or a relicence (`CONTRIBUTING.md`) |
-
-### Where this sits
-
-Two DFE apps depend on it: dfe-loader with `ext`, `tls` and `dynamic`, and dfe-fetcher with `ext`, behind its db crate's `clickhouse` feature. `dfe-stack suite --producer dfe-clickhouse-rs` lists the consumers dfe-infra's `suite.yaml` records, where this node is a general-audience OSS library with `default_in_pass: false`. The graph does not carry the upstream relationship:
-
-| Repo | Direction | Kind | Mechanism |
-|---|---|---|---|
-| `ClickHouse/clickhouse-rs` | inbound | published crate, by version | `Cargo.toml` depends on the published `clickhouse` release, with `default-features = false`, and on nothing from that repo's git. The edition, the MSRV (`rust-version`) and `rustfmt.toml` are kept in step with it, so code travels between the two without a reformat |
-| `hyperi-io/dfe-loader` | outbound | crates.io dependency, by range | `Cargo.toml` takes `ext`, `tls` and `dynamic` |
-| `hyperi-io/dfe-fetcher` | outbound | crates.io dependency, by range, optional | `crates/db/Cargo.toml` takes `ext` behind the `clickhouse` feature |
-
-## Issues
-
-Open bugs: [this repo](https://github.com/hyperi-io/dfe-clickhouse-rs/issues?q=is%3Aopen+is%3Aissue+type%3ABug+-label%3Abacklog+-label%3Anext-minor) | [whole DFE suite](https://github.com/search?type=issues&q=is%3Aopen+is%3Aissue+type%3ABug+-label%3Abacklog+-label%3Anext-minor+repo%3Ahyperi-io%2Fdfe-infra+repo%3Ahyperi-io%2Fdfe-docker+repo%3Ahyperi-io%2Fdfe-deploy+repo%3Ahyperi-io%2Fdfe-engine+repo%3Ahyperi-io%2Fdfe-loader+repo%3Ahyperi-io%2Fdfe-receiver+repo%3Ahyperi-io%2Fdfe-fetcher+repo%3Ahyperi-io%2Fdfe-archiver+repo%3Ahyperi-io%2Fdfe-transform-vrl+repo%3Ahyperi-io%2Fdfe-transform-vector+repo%3Ahyperi-io%2Fdfe-transform-elastic+repo%3Ahyperi-io%2Fdfe-ui+repo%3Ahyperi-io%2Fdfe-hyperdx+repo%3Ahyperi-io%2Fscalo-rs+repo%3Ahyperi-io%2Fscalo-py+repo%3Ahyperi-io%2Flogreducer+repo%3Ahyperi-io%2Fdfe-schemas+repo%3Ahyperi-io%2Fvector-vrl+repo%3Ahyperi-io%2Fculvert+repo%3Ahyperi-io%2Fdfe-clickhouse-rs+repo%3Ahyperi-io%2Ffactbook-rs)

@@ -2,10 +2,7 @@
 
 Start at the [README](../README.md): it is the GitHub front page, and docs.rs renders it as the crate docs. [crate.md](crate.md) is the crates.io page, so a change to what the crate offers lands in both.
 
-Design rationale lives in code comments at the point of use, so a file
-cherry-picked into another repository carries its reasoning with it. That is
-deliberate -- this index stays thin rather than duplicating what the source
-already says and would drift from.
+Design rationale lives in code comments at the point of use, so a file cherry-picked into another repository takes its reasoning with it. This index stays thin, so it does not repeat the source and drift from it.
 
 A layer gets a page here once its reasoning outgrows a comment:
 

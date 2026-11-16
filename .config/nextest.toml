@@ -5,9 +5,7 @@
 # License:   Apache-2.0
 # Copyright: (c) 2026 HYPERI PTY LIMITED
 
-# nextest runs each test in its own process, so a semaphore inside the binary
-# cannot serialise them -- this group is the only thing that does. One server
-# at a time: seven at 2 GiB each does not fit a build host.
+# One ClickHouse server at a time. nextest runs each test as a process, so this group is what serialises them.
 [test-groups]
 docker-server = { max-threads = 1 }
 

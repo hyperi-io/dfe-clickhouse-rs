@@ -1,11 +1,11 @@
 # dfe-clickhouse
 
-Extensions for the official [`clickhouse`](https://crates.io/crates/clickhouse) Rust client, built for loading data in volume. It adds the native protocol over TCP and TLS, inserts whose columns are only known at runtime, and one client that runs over either transport.
+Extensions for the official [`clickhouse`](https://crates.io/crates/clickhouse) Rust client, built for loading data in volume. It adds the native protocol over TCP and TLS, inserts with columns known only at runtime, and one client that runs over either transport.
 
-It depends on the published `clickhouse` release and changes nothing in it, so the HTTP client you already use keeps working as it is. What it gives you:
+It depends on the published `clickhouse` release and changes nothing in it, so the HTTP client you use keeps working as it is. What it gives you:
 
 - The native protocol on port 9000, with TLS, a connection pool, endpoint failover and opt-in jittered retry for idempotent calls.
-- Runtime-schema inserts: hand it `serde_json::Map` rows, with no Rust struct written per table. `Tuple`, `Variant` and `Dynamic` columns are refused by name.
+- Runtime-schema inserts: hand it `serde_json::Map` rows, with no Rust struct written per table. `Tuple`, `Variant` and `Dynamic` columns are rejected by name.
 - A per-table schema read from `system.columns` and cached, so rows encode straight to RowBinary or Native, never to JSONEachRow text for the server to parse.
 - Explicit per-table batches: each insert targets one table and commits on `end()`, or earlier where its rows supply different sets of defaulted columns. Over TCP the rows go as Native blocks, each sent once it holds 1 MiB or `TcpClient::DEFAULT_INSERT_BLOCK_ROWS` (1,000,000) rows.
 - Insert errors classified as transport, schema drift or bad rows. A transport failure can leave it unknown whether the rows landed, so retry only where a duplicate is harmless or deduplicated.
@@ -63,7 +63,7 @@ async fn main() -> dfe_clickhouse::Result<()> {
 
 Add `clickhouse` too, swap in `UnifiedClient::Http(clickhouse::Client::default().with_url("http://localhost:8123"))`, and the same rows go over HTTP.
 
-Why native, measured on 2026-11-01 with a 100k-row runtime-schema insert against ClickHouse 26.3 ([method and full table](https://github.com/hyperi-io/dfe-clickhouse-rs/blob/main/docs/insert-formats.md#native-against-http-rowbinary)):
+Why native, from a run on 2026-11-01 of a 100k-row runtime-schema insert against ClickHouse 26.3 ([method and full table](https://github.com/hyperi-io/dfe-clickhouse-rs/blob/main/docs/insert-formats.md#native-against-http-rowbinary)):
 
 - About half the elapsed time: 799 and 920 ms against 1,548-2,281 ms over HTTP RowBinary.
 - 16-36% less server CPU: 772 and 889 ms against 997-1,206 ms.

@@ -1,5 +1,5 @@
 [toolchain]
 channel = "1.99.1"
-profile = "minimal" # Don't download docs, sources, etc. on CI
+profile = "minimal"
 # `minimal` omits rustfmt and clippy, and both are quality gates here.
 components = ["rustfmt", "clippy"]

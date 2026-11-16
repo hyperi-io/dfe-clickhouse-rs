@@ -6,11 +6,7 @@
 # License:   Apache-2.0
 # Copyright: (c) 2026 HYPERI PTY LIMITED
 
-# Local builds fail on the same warnings CI fails on. Crates.io dependencies
-# are compiled with --cap-lints allow, so this only ever bites this crate.
-#
-# Target rustflags join any CARGO_TARGET_<TRIPLE>_RUSTFLAGS the CI runner sets,
-# which would discard `[build]` rustflags outright.
+# Target sections, because a runner's CARGO_TARGET_<TRIPLE>_RUSTFLAGS discards `[build]` rustflags.
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-D", "warnings"]
 

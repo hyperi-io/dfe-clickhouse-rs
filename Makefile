@@ -7,7 +7,6 @@
 
 .PHONY: check quality test build check-features
 
-# The full local pre-push gate -- the same suite CI runs.
 check:
 	hyperi-ci check
 
@@ -20,8 +19,7 @@ test:
 build:
 	hyperi-ci run build
 
-# Both ends of the feature matrix. Every layer is optional, so a change that
-# only compiles with the default set is a broken change.
+# CONTRIBUTING.md, "Run the checks locally before you push".
 check-features:
 	cargo check --all-features
 	cargo check --no-default-features
