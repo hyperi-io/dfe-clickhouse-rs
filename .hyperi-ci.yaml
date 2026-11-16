@@ -15,9 +15,7 @@ quality:
   enabled: true
 test:
   enabled: true
-  # test.min_coverage is honoured for Python only, so on Rust this reports
-  # without gating and swaps nextest for cargo's harness. The floor is held by
-  # cargo llvm-cov at the review gate instead.
+  # docs/coverage.md says why.
   coverage: false
   rust:
     nextest: true
@@ -26,8 +24,7 @@ build:
   strategies:
   - native
   rust:
-    # Every layer but the codec is a feature. `-D warnings` reaches only this
-    # set, and the feature matrix reports the others' warnings without failing.
+    # What `-D warnings` reaches: CONTRIBUTING.md, "Commands that prove a change".
     features: all
     targets: []
 release:

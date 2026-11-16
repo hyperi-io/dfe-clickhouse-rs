@@ -7,14 +7,9 @@ yanked = "warn"
 # cargo-audit reports unsound advisories on every crate, so deny matches it and
 # each ignore below is one both tools see.
 unsound = "all"
-# hyperi-ci passes this list to cargo-audit and osv-scanner as well.
-#
-# zstd 0.13.3 / zstd-safe 7.3.0 arrive only through the opt-in `zstd` feature:
-# clickhouse 0.15.3 takes zstd ^0.13 with default-features off, so zstd-safe
-# resolves with `std` alone. clickhouse calls zstd_safe::compress (one-shot
-# ZSTD_compress) and decodes HTTP responses with a fresh raw::Decoder::new per
-# response. Every fix is in zstd 0.14.3 / zstd-safe 8.2.0, which no clickhouse
-# release takes yet. Drop the block when one moves to zstd 0.14.
+# hyperi-ci passes this list to cargo-audit and osv-scanner as well. The zstd
+# entries arrive through the opt-in `zstd` feature alone, and go once a
+# clickhouse release takes zstd 0.14.
 ignore = [
     { id = "RUSTSEC-2026-0391", reason = "raw::{Encoder,Decoder}::with_context only, and clickhouse never reuses a context" },
     { id = "RUSTSEC-2026-0395", reason = "CCtx::set_parameter with StableInBuffer. clickhouse builds no CCtx" },
@@ -52,9 +47,7 @@ multiple-versions = "warn"
 wildcards = "deny"
 highlight = "all"
 
-# crates.io and nothing else. The empty allow-git is the enforcement point for
-# the rule that upstream `clickhouse` is consumed as a published version: a
-# `git =` dependency or a `[patch.crates-io]` on a fork fails this check.
+# crates.io alone: a `git =` dependency, or a `[patch.crates-io]` onto a git fork, fails here.
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"

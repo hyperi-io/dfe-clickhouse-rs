@@ -22,9 +22,7 @@ readme = "docs/crate.md"
 publish = true
 keywords = ["clickhouse", "database", "tcp", "tokio"]
 categories = ["database", "asynchronous"]
-# `docs/` ships: the type-support and insert-format pages are consumer-facing,
-# and `src/native/mod.rs` and `src/tcp/pool.rs` point at `docs/coverage.md`.
-# `.github/` and `.githooks/` are repo machinery and stay out.
+# `docs/` ships, because `src/native/mod.rs` and `src/tcp/pool.rs` point at `docs/coverage.md`.
 exclude = [".github/", ".githooks/"]
 
 [package.metadata.docs.rs]
@@ -32,10 +30,7 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
-# The HTTP client is the default story: upstream's `clickhouse::Client` plus
-# our extension traits. `ext` pulls no dependencies of its own, and the native
-# transport is a deliberate opt-in rather than something every consumer pays
-# for. Adding to this set later is non-breaking; removing from it is not.
+# docs/architecture.md, "The layers".
 default = ["lz4", "ext"]
 tcp = ["dep:deadpool", "dep:socket2", "dep:backon"]
 tls = [
@@ -46,7 +41,6 @@ tls = [
     "dep:webpki-roots",
     "dep:rustls-native-certs",
 ]
-# Block compression is upstream's; this crate negotiates `None` on TCP.
 lz4 = ["clickhouse/lz4"]
 zstd = ["clickhouse/zstd"]
 dynamic = ["dep:serde_json"]
@@ -63,7 +57,7 @@ full = [
 ]
 
 [dependencies]
-# The only link to upstream: a crates.io release, never git/path/[patch].
+# A crates.io release alone: CONTRIBUTING.md, "Stay close to upstream".
 clickhouse = { version = "0.15.3", default-features = false }
 
 serde = { version = ">=1.0.229, <2", features = ["derive"] }
@@ -75,11 +69,9 @@ tokio = { version = ">=1.54.1, <2", features = ["rt", "macros", "io-util", "sync
 
 # tcp
 deadpool = { version = ">=0.13.1, <0.14", default-features = false, features = ["managed", "rt_tokio_1"], optional = true }
-# 0.6 shares the socket2 that tokio and hyper-util already resolve to.
+# 0.6 shares the socket2 that tokio and hyper-util resolve to.
 socket2 = { version = ">=0.6.5, <0.7", features = ["all"], optional = true }
-# Retry/backoff, matching scalo-rs. Jitter is the reason: a hand-rolled
-# schedule desynchronises nothing, so a pool-wide reconnect storm retries
-# in lockstep.
+# Jittered backoff, so a pool-wide reconnect storm does not retry in lockstep.
 backon = { version = ">=1.6.0, <2", default-features = false, features = ["std", "tokio-sleep"], optional = true }
 
 # tls
@@ -94,7 +86,7 @@ rustls-native-certs = { version = ">=0.8.5, <0.9", optional = true }
 serde_json = { version = ">=1.0.154, <2", optional = true }
 
 [dev-dependencies]
-# `-native-roots` only picks the trust source; the HTTPS connector needs `-aws-lc` too.
+# `-native-roots` picks the trust source, and the HTTPS connector needs `-aws-lc` as well.
 clickhouse = { version = "0.15.3", default-features = false, features = ["test-util", "rustls-tls-aws-lc", "rustls-tls-native-roots"] }
 tokio = { version = ">=1.54.1, <2", features = ["full", "test-util"] }
 serde_json = ">=1.0.154, <2"
@@ -111,7 +103,6 @@ proptest = { version = ">=1.12.0, <2", default-features = false, features = ["st
 name = "insert_bench"
 required-features = ["full"]
 
-# Upstream's `rust_2018_idioms` and `unreachable_pub`, plus `unsafe_code` and `missing_docs`.
 [lints.rust]
 rust_2018_idioms = { level = "warn", priority = -1 }
 unreachable_pub = "warn"

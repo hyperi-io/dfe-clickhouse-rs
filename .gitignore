@@ -39,10 +39,7 @@ coverage.lcov
 tarpaulin-report.json
 cobertura.xml
 
-# cargo -- everything local except the two committed config files. The
-# excluded pattern has to be the directory CONTENTS, not the directory
-# itself: git never descends into an excluded directory, so a negation
-# under `.cargo/` would never be reached.
+# The contents, not the directory, so the two negations below can match.
 /.cargo/*
 !/.cargo/config.toml
 !/.cargo/audit.toml
@@ -50,9 +47,7 @@ cobertura.xml
 # Git worktrees (local dev convenience)
 .worktrees/
 
-# AI agent working files -- local-only, never committed. Mirrored in
-# .git/info/exclude, because a tracked .gitignore alone does not protect a
-# clone that has not pulled it yet.
+# AI agent working files, mirrored in .git/info/exclude.
 docs/superpowers/
 .hyperi-ai/
 CLAUDE.md
@@ -67,9 +62,6 @@ GEMINI.md
 .cursor/
 .gemini/
 
-# Local scratch / tmp (CORE.md: scratch goes here, gitignored, NOT
-# /tmp). Bare patterns (no leading slash) match a tmp dir at ANY
-# depth, so these cover top-level .tmp/ and tmp/ as well as nested
-# ones like tests/tmp/.
+# Local scratch, at any depth.
 .tmp/
 tmp/

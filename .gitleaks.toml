@@ -1,20 +1,4 @@
-# Project-specific gitleaks allowlist
-# Extends the CI base configuration (ci/.gitleaks.toml)
-#
-# The CI runs gitleaks to detect secrets in your code. This file lets you
-# exclude false positives specific to your project.
-#
-# Documentation: https://github.com/gitleaks/gitleaks#configuration
+# Project gitleaks allowlist: https://github.com/gitleaks/gitleaks#configuration
 
 [extend]
 useDefault = true
-
-# Uncomment and customise as needed:
-#
-# [[allowlists]]
-# description = "Project-specific false positives"
-# paths = ['''tests/fixtures/.*''']
-#
-# [[allowlists]]
-# description = "Example config files"
-# paths = ['''.env.example''', '''.env.sample''']
