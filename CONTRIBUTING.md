@@ -69,45 +69,6 @@ messages. Do not manually update version numbers.
 While the crate is pre-1.0 the API is unstable, and a minor bump can carry a
 breaking change.
 
-## Developer Certificate of Origin
-
-This project uses the Developer Certificate of Origin (DCO), so each contributor certifies they have the right to submit their contribution.
-
-By making a contribution to this project, you certify that:
-
-1. The contribution was created in whole or in part by you and you have the
-   right to submit it under the license indicated in the file; or
-
-2. The contribution is based upon previous work that, to the best of your
-   knowledge, is covered under an appropriate open source license and you
-   have the right under that license to submit that work with modifications;
-   or
-
-3. The contribution was provided directly to me by some other person who
-   certified (1), (2) or (3) and you have not modified it.
-
-4. You understand and agree that this project and the contribution are public
-   and that a record of the contribution (including all personal information
-   you submit with it, including your sign-off) is maintained indefinitely
-   and may be redistributed consistent with this project or the license(s)
-   involved.
-
-## How to Sign Off Your Commits
-
-You must sign off each commit to indicate your acceptance of the DCO. Combine
-the signoff with your conventional commit message:
-
-```bash
-git commit --signoff -m "feat(tcp): add connection-level query timeout"
-```
-
-Make sure your Git configuration has your correct name and email:
-
-```bash
-git config --global user.name "Your Name"
-git config --global user.email "your.email@example.com"
-```
-
 ## Feature layers
 
 Every layer of this crate but the Native codec is behind a Cargo feature, so a change that only compiles with the default set is a broken change. Check both ends of the matrix before you push:
@@ -132,14 +93,12 @@ hyperi-ci check
 
 1. Fork the repository and create your branch from `main`
 2. Make your changes, following the commit message format above
-3. Sign off your commits with the DCO
-4. Run the tests and `make check-features`
-5. Open a pull request that says what changed and why
+3. Run the tests and `make check-features`
+4. Open a pull request that says what changed and why
 
 ### Pull Request Checklist
 
 - [ ] Commits follow the conventional commit format
-- [ ] All commits are signed off (DCO)
 - [ ] `make check-features` passes
 - [ ] Tests pass
 - [ ] Documentation is updated (if applicable)
