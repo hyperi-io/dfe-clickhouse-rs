@@ -63,7 +63,7 @@ flowchart LR
 
 *Figure 1. L4 Detail -- Reads over both transports. Dashed boxes are external.* Up: [L3 Components -- dfe-clickhouse](architecture.md).
 
-`fetch_columns` returns column-wise `Columns` on either arm. The HTTP path sends `client_protocol_version`, so the server writes the revision of the Native format the TCP handshake negotiates, and decodes it with this crate's Native codec rather than upstream's reader, which rejects `JSON`, `Variant` and `Dynamic`. One codec serves both transports, which is why a `JSON` column reads the same over each. An HTTP read of an `Array` column a few thousand rows long fails where TCP reads it, a defect tracked in [#48](https://github.com/hyperi-io/dfe-clickhouse-rs/issues/48).
+`fetch_columns` returns column-wise `Columns` on either arm. The HTTP path sends `client_protocol_version`, so the server writes the revision of the Native format the TCP handshake negotiates, and decodes it with this crate's Native codec rather than upstream's reader, which rejects `JSON`, `Variant` and `Dynamic`. One codec serves both transports, which is why a `JSON` column reads the same over each. An HTTP read of an `Array` column a few thousand rows long can fail where TCP reads it, a defect tracked in [#48](https://github.com/hyperi-io/dfe-clickhouse-rs/issues/48).
 
 `dynamic_insert` resolves the schema through whichever transport is configured and returns a `DynamicInsert` bound to it. The TCP arm resolves the schema eagerly, because `DynamicInsert::tcp` needs it up front. The HTTP arm leaves it to the first write. Encoding is RowBinaryWithNamesAndTypes for HTTP and Native columnar for TCP, sharing the encoder.
 

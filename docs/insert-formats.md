@@ -61,7 +61,7 @@ Neither format has a per-row default. An INSERT names the required columns and t
 
 So an error late in a batch can follow rows the server has committed. Retry the whole batch where duplicates are harmless or the table deduplicates inserts: a `ReplicatedMergeTree`, or a `MergeTree` with `non_replicated_deduplication_window` set.
 
-Where the client sets `insert_deduplication_token`, each INSERT gets that token plus the defaulted columns its rows supply and a count of the earlier INSERTs with that set. The INSERTs of one batch then do not suppress each other, and a retry of the same rows in the same order, over the same transport, lands once. HTTP and TCP group rows into INSERTs differently, so a retry over the other transport derives different tokens.
+Where the client sets `insert_deduplication_token`, each INSERT gets that token plus the defaulted columns its rows supply and a count of the earlier INSERTs with that set. The INSERTs of one batch then do not suppress each other, and a retry of the same rows in the same order, over the same transport, lands once. When a batch's rows carry more than one set of defaulted columns, HTTP and TCP group them into INSERTs differently, so a retry over the other transport can derive different tokens.
 
 A row that supplies no column at all, on a table where every column has a default, goes over HTTP as `RowBinaryWithDefaults` with every column flagged, so no value crosses the wire.
 

@@ -1,6 +1,6 @@
 # Column type support
 
-What the Native codec reads and writes. Every type listed as supported is read back from a ClickHouse server in `tests/wire_docker.rs`, on both transports, with the server building the values. Three have no row in that matrix: `Time` and `Time64`, which decode as signed seconds and signed ticks at the column's precision, and `Object('json')`. An HTTP read of an `Array` column a few thousand rows long fails where TCP reads it, a defect tracked in [#48](https://github.com/hyperi-io/dfe-clickhouse-rs/issues/48).
+What the Native codec reads and writes. Every type listed as supported is read back from a ClickHouse server in `tests/wire_docker.rs`, on both transports, with the server building the values. Three have no row in that matrix: `Time` and `Time64`, which decode as signed seconds and signed ticks at the column's precision, and `Object('json')`. An HTTP read of an `Array` column a few thousand rows long can fail where TCP reads it, a defect tracked in [#48](https://github.com/hyperi-io/dfe-clickhouse-rs/issues/48).
 
 ## Scalars and strings
 
