@@ -53,7 +53,7 @@ flowchart LR
     class entry,transports group
 ```
 
-*Figure 1. L3 Components -- dfe-clickhouse. Dashed boxes are external.* Up: top of dfe-clickhouse-rs. Down: [L4 Detail -- Reads over both transports](unified-client.md), [L4 Detail -- Dynamic insert formats](insert-formats.md).
+*Figure 1. L3 Components -- dfe-clickhouse. clickhouse::Client and ClickHouse server are external.* Up: top of dfe-clickhouse-rs. Down: [L4 Detail -- Reads over both transports](unified-client.md), [L4 Detail -- Dynamic insert formats](insert-formats.md).
 
 The codec serves more than the TCP transport. `UnifiedClient` decodes an HTTP answer with it, and the dynamic insert builds its TCP blocks with it. The `ext` traits add methods to `clickhouse::Client`, and `tls` gives the TCP transport its rustls trust.
 

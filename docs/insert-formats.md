@@ -47,7 +47,7 @@ flowchart LR
     class http,server ext
 ```
 
-*Figure 1. L4 Detail -- Dynamic insert formats. Dashed boxes are external.* Up: [L3 Components -- dfe-clickhouse](architecture.md).
+*Figure 1. L4 Detail -- Dynamic insert formats. clickhouse::Client and ClickHouse server are external.* Up: [L3 Components -- dfe-clickhouse](architecture.md).
 
 The schema cache fills from `system.columns`. Each open INSERT sends once its buffer holds 1 MiB of rows, and over TCP at `TcpClient::DEFAULT_INSERT_BLOCK_ROWS` (1,000,000) rows if that comes first, so a large batch never sits whole in memory. A batch under 1 MiB stays buffered until `end()`, and over HTTP each of the four open INSERTs has a separate buffer.
 
